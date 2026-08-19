@@ -1,7 +1,7 @@
 // Wires everything together: store → data → geometry → SVG → screen, plus the
 // direct-manipulation bits (pan, zoom, click-to-place-pin) on the preview.
 
-import { createStore, loadSaved, persist, createDefaultState, hydrate } from './state.js';
+import { createStore, loadSaved, persist, createDefaultState, hydrate, snapshot } from './state.js';
 import { LAYER_DATA_NEEDS } from './layers.js';
 import { createProjection, padBounds, boundsContain, formatCoordinate } from './geo.js';
 import { computeLayout } from './layout.js';
@@ -35,6 +35,68 @@ let fetchController = null;
 let fetchTimer = null;
 let renderQueued = false;
 let panel;
+
+// ------------------------------------------------------------------- history
+// Undo works in gestures, not in individual events: dragging a slider for two
+// seconds should be one step, not forty. The state from before a burst of
+// changes is held back until the burst goes quiet, then committed.
+const HISTORY_LIMIT = 80;
+const BURST_MS = 450;
+const undoStack = [];
+const redoStack = [];
+let pendingBefore = null;
+let burstTimer = null;
+
+function commitBurst() {
+  clearTimeout(burstTimer);
+  if (!pendingBefore) return;
+  undoStack.push(pendingBefore);
+  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+  redoStack.length = 0;
+  pendingBefore = null;
+  refreshHistoryButtons();
+}
+
+function recordChange(before) {
+  if (!pendingBefore) pendingBefore = before;
+  clearTimeout(burstTimer);
+  burstTimer = setTimeout(commitBurst, BURST_MS);
+  refreshHistoryButtons();
+}
+
+function refreshHistoryButtons() {
+  panel?.setHistoryState(undoStack.length > 0 || Boolean(pendingBefore), redoStack.length > 0);
+}
+
+function applyHistory(next, message) {
+  store.replace(hydrate(next), { refetch: true, track: false });
+  panel.renderCaptionLines();
+  panel.sync();
+  refreshHistoryButtons();
+  setStatus(message, 'ok');
+}
+
+function undo() {
+  commitBurst();
+  const previous = undoStack.pop();
+  if (!previous) {
+    setStatus('Nothing left to undo.', 'info');
+    return;
+  }
+  redoStack.push(snapshot(store.get()));
+  applyHistory(previous, 'Undone.');
+}
+
+function redo() {
+  commitBurst();
+  const next = redoStack.pop();
+  if (!next) {
+    setStatus('Nothing to redo.', 'info');
+    return;
+  }
+  undoStack.push(snapshot(store.get()));
+  applyHistory(next, 'Redone.');
+}
 
 // -------------------------------------------------------------------- status
 let statusTimer = null;
@@ -241,6 +303,20 @@ function clientToMm(event) {
   };
 }
 
+/** True when a millimetre point falls inside the caption's grab area. */
+function overCaption(point) {
+  const caption = currentLayout?.caption;
+  if (!caption?.hasText || !store.get().caption.enabled) return false;
+  const pad = 1.5;
+  const { box } = caption;
+  return (
+    point.x >= box.minX - pad &&
+    point.x <= box.maxX + pad &&
+    point.y >= box.minY - pad &&
+    point.y <= box.maxY + pad
+  );
+}
+
 function setupPreviewInteraction() {
   let drag = null;
 
@@ -260,19 +336,35 @@ function setupPreviewInteraction() {
       setStatus(`Pin placed at ${lat.toFixed(5)}, ${lon.toFixed(5)}.`, 'ok');
       return;
     }
-    drag = { x: event.clientX, y: event.clientY, scale: point.scale, moved: false };
+    // Grabbing the caption moves the caption; grabbing anywhere else pans.
+    const mode = overCaption(point) ? 'caption' : 'map';
+    drag = { x: event.clientX, y: event.clientY, scale: point.scale, moved: false, mode };
     dom.preview.setPointerCapture(event.pointerId);
-    dom.preview.classList.add('is-dragging');
+    dom.preview.classList.add(mode === 'caption' ? 'is-moving-caption' : 'is-dragging');
   });
 
   dom.preview.addEventListener('pointermove', (event) => {
-    if (!drag || !currentProjection) return;
+    if (!drag) {
+      // Hover feedback, so it is discoverable that the caption can be dragged.
+      const point = clientToMm(event);
+      dom.preview.classList.toggle('is-over-caption', !placingPin && Boolean(point) && overCaption(point));
+      return;
+    }
+    if (!currentProjection) return;
     const dxMm = (event.clientX - drag.x) * drag.scale;
     const dyMm = (event.clientY - drag.y) * drag.scale;
     if (Math.abs(dxMm) < 0.05 && Math.abs(dyMm) < 0.05) return;
     drag.x = event.clientX;
     drag.y = event.clientY;
     drag.moved = true;
+
+    if (drag.mode === 'caption') {
+      store.set((s) => {
+        s.caption.offsetX += dxMm;
+        s.caption.offsetY += dyMm;
+      });
+      return;
+    }
 
     const centre = currentLayout.projectionRect;
     const cx = centre.x + centre.w / 2;
@@ -288,8 +380,11 @@ function setupPreviewInteraction() {
   const endDrag = (event) => {
     if (!drag) return;
     dom.preview.releasePointerCapture?.(event.pointerId);
-    dom.preview.classList.remove('is-dragging');
-    if (drag.moved) panel.renderCaptionLines();
+    dom.preview.classList.remove('is-dragging', 'is-moving-caption');
+    if (drag.moved) {
+      if (drag.mode === 'caption') panel.sync();
+      else panel.renderCaptionLines();
+    }
     drag = null;
   };
   dom.preview.addEventListener('pointerup', endDrag);
@@ -308,7 +403,21 @@ function setupPreviewInteraction() {
   );
 
   window.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && placingPin) setPlacingPin(false);
+    if (event.key === 'Escape' && placingPin) {
+      setPlacingPin(false);
+      return;
+    }
+    // Leave Ctrl+Z alone while a field has focus so it still undoes typing.
+    const editing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '');
+    if (editing || !(event.ctrlKey || event.metaKey)) return;
+    const key = event.key.toLowerCase();
+    if (key === 'z' && !event.shiftKey) {
+      event.preventDefault();
+      undo();
+    } else if ((key === 'z' && event.shiftKey) || key === 'y') {
+      event.preventDefault();
+      redo();
+    }
   });
 }
 
@@ -351,7 +460,9 @@ const actions = {
       s.location.label = result.primary || result.display;
       s.location.region = result.secondary || '';
       s.location.query = result.display;
-      if (s.caption.autoFill !== false) fillCaption(s);
+      // Choosing a search result is an explicit "I want this place", so the
+      // caption is always rewritten — that is the whole point of searching.
+      fillCaption(s);
       if (s.pin.followCentre) {
         s.pin.lat = result.lat;
         s.pin.lon = result.lon;
@@ -359,7 +470,10 @@ const actions = {
     }, { refetch: true });
     panel.renderCaptionLines();
     panel.sync();
-    setStatus(`Centred on ${result.primary || result.display}.`, 'ok');
+    setStatus(
+      `Centred on ${result.primary || result.display}, and the caption now reads it back.`,
+      'ok'
+    );
   },
 
   loadDemo,
@@ -371,6 +485,9 @@ const actions = {
   togglePlacePin() {
     setPlacingPin(!placingPin);
   },
+
+  undo,
+  redo,
 
   exportSvg() {
     const state = store.get();
@@ -406,11 +523,15 @@ const actions = {
   },
 
   reset() {
-    if (!confirm('Start over with the default design? Your current settings will be lost.')) return;
-    store.replace(createDefaultState(), { refetch: true });
+    if (!confirm('Reset every setting to the defaults? You can still undo this afterwards.')) return;
+    commitBurst();
+    undoStack.push(snapshot(store.get()));
+    redoStack.length = 0;
+    store.replace(createDefaultState(), { refetch: true, track: false });
     panel.renderCaptionLines();
     panel.sync();
-    setStatus('Back to the default design.', 'ok');
+    refreshHistoryButtons();
+    setStatus('Back to the default design. Undo will bring your settings back.', 'ok');
   },
 };
 
@@ -439,11 +560,13 @@ async function boot() {
 
   store.subscribe((state, meta) => {
     persist(state);
+    if (meta.before) recordChange(meta.before);
     // `silent` updates only touch bookkeeping (the search box text), so they
     // do not need the whole coaster redrawn on every keystroke.
     if (!meta.silent) requestRender();
     if (meta.refetch) scheduleFetch();
   });
+  refreshHistoryButtons();
 
   render();
   scheduleFetch(0);

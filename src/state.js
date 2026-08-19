@@ -28,6 +28,7 @@ export function captionLine(overrides = {}) {
     lineHeight: 1.32,
     textCase: 'none',
     align: 'center',
+    offsetX: 0,
     ...overrides,
   };
 }
@@ -93,8 +94,8 @@ export function createDefaultState() {
       lat: 39.1031,
       lon: -84.512,
       followCentre: true,
-      style: 'disc',
-      radius: 7,
+      style: 'oval',
+      radius: 6,
       strokeWidth: 0.6,
       text: 'Home',
       font: 'playfair-display',
@@ -103,6 +104,7 @@ export function createDefaultState() {
       textSize: 3.4,
       tracking: 0,
       textCase: 'none',
+      textOffsetY: 0,
       knockout: true,
       clearSpace: true,
       clearance: 0.8,
@@ -112,6 +114,8 @@ export function createDefaultState() {
       enabled: true,
       autoFill: true,
       gap: 3,
+      offsetX: 0,
+      offsetY: 0,
       lines: [
         captionLine({ text: 'Cincinnati, Ohio', size: 7, weight: 400, tracking: 0.1 }),
         captionLine({ text: '39.1031° N, 84.5120° W', size: 5.2, tracking: 0.16 }),
@@ -163,19 +167,35 @@ export function persist(state) {
   }
 }
 
-/** Minimal observable store: `set` mutates via a callback then notifies. */
+export function snapshot(state) {
+  return JSON.parse(JSON.stringify(state));
+}
+
+/**
+ * Minimal observable store: `set` mutates via a callback then notifies.
+ *
+ * Every tracked change hands listeners a copy of the state as it was *before*
+ * the mutation, which is what the undo history is built from. Pass
+ * `{ track: false }` for changes that should not create an undo step — undo and
+ * redo themselves, most obviously.
+ */
 export function createStore(initial) {
   let state = initial;
   const listeners = new Set();
+  const notify = (meta) => {
+    for (const fn of listeners) fn(state, meta);
+  };
   return {
     get: () => state,
     set(mutator, meta = {}) {
+      const before = meta.track === false || meta.silent ? null : snapshot(state);
       mutator(state);
-      for (const fn of listeners) fn(state, meta);
+      notify({ ...meta, before });
     },
     replace(next, meta = {}) {
+      const before = meta.track === false ? null : snapshot(state);
       state = next;
-      for (const fn of listeners) fn(state, meta);
+      notify({ ...meta, before });
     },
     subscribe(fn) {
       listeners.add(fn);

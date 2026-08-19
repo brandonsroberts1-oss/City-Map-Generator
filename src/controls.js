@@ -148,9 +148,9 @@ export function select({ label, options, value, hint, onChange, styleOptions = f
   });
 }
 
-export function segmented({ label, options, value, hint, onChange }) {
+export function segmented({ label, options, value, hint, onChange, wrap = false }) {
   const buttons = [];
-  const group = el('div', { class: 'segmented', role: 'group' });
+  const group = el('div', { class: 'segmented' + (wrap ? ' is-wrap' : ''), role: 'group' });
   for (const opt of options) {
     const button = el('button', {
       type: 'button',

@@ -37,17 +37,28 @@ thickness in millimetres. Area layers (water, parks, buildings) draw either as
 solid shapes or as outlines.
 
 **Frame.** Square, rounded-square or round coasters at any size, with a border of
-adjustable thickness and corner radius that encloses either the map alone or the
-whole face. There is an optional cut line on its own layer.
+adjustable thickness and corner radius. **Map only** puts the frame around the
+map with the caption below it; **Map + caption** runs it around the coaster
+perimeter with the place name inside, as on the reference coaster. There is an
+optional cut line on its own layer.
 
 **Caption.** Any number of lines under the map, each with its own font, weight,
-italic, size, letter-spacing, line-spacing, capitalisation and alignment. "Fill
-from location" writes the place name and formatted coordinates for you, and keeps
-them in step as you pan until you edit the text yourself.
+italic, size, letter-spacing, line-spacing, capitalisation, alignment and
+sideways nudge. Drag the caption in the preview to move the whole block, or nudge
+it with the sliders. Searching a place rewrites the place name and coordinates
+for you, and panning keeps the coordinates in step until you edit the text
+yourself.
 
-**Pin.** A filled disc, a ring, a classic teardrop marker, or a plain dot —
-centred on the map or dropped anywhere by clicking. Put `Home`, `Family` or
-anything else inside it, knocked out of the disc so the letters stay unengraved.
+**Pin.** Seven marker shapes — disc, oval, pill, heart, teardrop map pin, ring
+and plain dot — centred on the map or dropped anywhere by clicking. Put `Home`,
+`Family` or anything else inside, knocked out of the shape so the letters stay
+unengraved. The oval and pill stretch to fit the word; the round shapes grow as a
+whole, so "Pin size" is a floor rather than a hard limit and a long word never
+spills over the edge.
+
+**Undo.** Undo and redo sit at the top of the panel and answer to Ctrl/Cmd+Z and
+Ctrl/Cmd+Shift+Z. History works in gestures, so dragging a slider is one step
+rather than forty. **Reset to defaults** is undoable too.
 
 **Labels.** Optional street, park and water names, rotated to follow the road
 they name, with collision avoidance and a cap on how many appear.
@@ -121,8 +132,11 @@ npm test -- --no-browser
 The suite checks the projection round-trips, that clipping and knockout
 subtraction remove exactly the right area, that multipolygon lakes keep their
 islands, that no geometry escapes the map window, that nothing survives under the
-pin, and that a real browser can boot the app, edit a design, export an SVG and
-restore it after a reload.
+pin, and that every marker shape's knockout really covers the shape drawn on top
+of it. The browser pass boots the app, cycles through all seven marker shapes,
+drags the caption, undoes and redoes, resets, searches a stubbed place and checks
+the caption filled itself, then exports an SVG and confirms it restores after a
+reload.
 
 `node tools/render-fixture.mjs out.svg --preset labels` renders the demo city
 headlessly, which is handy when changing the geometry pipeline.
@@ -141,6 +155,8 @@ headlessly, which is handy when changing the geometry pipeline.
 | `src/layout.js` | Where the map, border and caption sit on the coaster |
 | `src/prepare.js` | Project, thin, clip and group geometry per layer |
 | `src/labels.js` | Label selection, placement and collision avoidance |
+| `src/pinshapes.js` | Marker outlines and their convex decompositions |
+| `src/paths.js` | Shared rounded-rect and ellipse path builders |
 | `src/knockouts.js` | The shapes punched out for the pin and labels |
 | `src/typography.js` | Font loading and text-to-outline conversion |
 | `src/render.js` | Builds the SVG for both preview and export |

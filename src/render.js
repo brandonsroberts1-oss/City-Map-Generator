@@ -3,6 +3,7 @@
 // colours and a few preview-only affordances differ.
 
 import { LAYERS, LINE } from './layers.js';
+import { buildPinShape, pinHeadOffset, TEXT_STYLES, minRadiusForText } from './pinshapes.js';
 import { getLoadedFont, textCommands, commandsToPathData, rotationMatrix, applyTextCase, measureText } from './typography.js';
 
 export const PREVIEW_THEMES = {
@@ -70,50 +71,38 @@ function ringsToPathData(areas, decimals) {
   return out.join('');
 }
 
-function circlePathData(cx, cy, r, decimals = 3) {
-  const f = (n) => num(n, decimals);
-  return (
-    `M${f(cx - r)} ${f(cy)}` +
-    `A${f(r)} ${f(r)} 0 0 1 ${f(cx + r)} ${f(cy)}` +
-    `A${f(r)} ${f(r)} 0 0 1 ${f(cx - r)} ${f(cy)}Z`
-  );
-}
-
-/** Classic teardrop marker: a disc with tangent lines running down to a tip. */
-function teardropPathData(cx, cy, r, stem, decimals = 3) {
-  const f = (n) => num(n, decimals);
-  const tipY = cy + r + Math.max(0.1, stem);
-  const d = tipY - cy;
-  const alpha = Math.acos(Math.min(1, r / d));
-  const theta = Math.PI / 2;
-  const a1 = theta - alpha;
-  const a2 = theta + alpha;
-  const p1 = [cx + r * Math.cos(a1), cy + r * Math.sin(a1)];
-  const p2 = [cx + r * Math.cos(a2), cy + r * Math.sin(a2)];
-  return (
-    `M${f(cx)} ${f(tipY)}L${f(p1[0])} ${f(p1[1])}` +
-    `A${f(r)} ${f(r)} 0 1 0 ${f(p2[0])} ${f(p2[1])}Z`
-  );
-}
-
 /**
  * Geometry for the location marker, including the box labels must avoid.
- * Returned separately from rendering so label placement can run first.
+ *
+ * Built before rendering because label placement has to know where the marker
+ * is, and the knockout has to know its exact outline.
  */
 export function computePin(state, layout, projection) {
-  const pin = state.pin;
-  if (!pin.enabled) return null;
-  const lat = pin.followCentre ? state.location.lat : pin.lat;
-  const lon = pin.followCentre ? state.location.lon : pin.lon;
+  const cfg = state.pin;
+  if (!cfg.enabled) return null;
+  const lat = cfg.followCentre ? state.location.lat : cfg.lat;
+  const lon = cfg.followCentre ? state.location.lon : cfg.lon;
   const [x, y] = projection.project(lon, lat);
 
-  const font = getLoadedFont(pin.font, pin.weight, pin.italic);
-  const text = pin.text ? applyTextCase(pin.text, pin.textCase) : '';
-  const metrics = text && font ? measureText(font, text, pin.textSize, pin.tracking) : null;
+  const font = getLoadedFont(cfg.font, cfg.weight, cfg.italic);
+  const wantsText = TEXT_STYLES.has(cfg.style) && Boolean(cfg.text);
+  const text = wantsText ? applyTextCase(cfg.text, cfg.textCase) : '';
+  const metrics = text && font ? measureText(font, text, cfg.textSize, cfg.tracking) : null;
 
-  const isTeardrop = pin.style === 'teardrop';
-  const headY = isTeardrop ? y - pin.radius - pin.stemLength : y;
-  const bottom = isTeardrop ? y : y + pin.radius;
+  const textWidth = metrics ? metrics.width : 0;
+  // A round shape that had to grow for its text hangs lower, so the head offset
+  // has to be measured from the size it actually ended up.
+  const effectiveRadius = Math.max(cfg.radius, minRadiusForText(cfg.style, textWidth));
+  const headY = y + pinHeadOffset(cfg.style, effectiveRadius, cfg.stemLength);
+
+  const shape = buildPinShape(cfg.style, {
+    cx: x,
+    cy: headY,
+    radius: cfg.radius,
+    stemLength: cfg.stemLength,
+    textWidth,
+    grow: cfg.clearSpace ? Math.max(0, cfg.clearance) : 0,
+  });
 
   return {
     x,
@@ -124,58 +113,50 @@ export function computePin(state, layout, projection) {
     text,
     metrics,
     font,
+    shape,
     box: {
-      minX: x - pin.radius - 0.6,
-      maxX: x + pin.radius + 0.6,
-      minY: headY - pin.radius - 0.6,
-      maxY: bottom + 0.6,
+      minX: shape.box.minX - 0.6,
+      maxX: shape.box.maxX + 0.6,
+      minY: shape.box.minY - 0.6,
+      maxY: shape.box.maxY + 0.6,
     },
   };
 }
 
-function pinMarkup(state, pin, ink, decimals) {
+function pinMarkup(state, pin, ink) {
   const cfg = state.pin;
   if (!pin) return '';
+  const { shape } = pin;
   const parts = [];
-  const cx = pin.x;
-  const cy = pin.headY;
 
-  const textCmds =
+  const textData =
     pin.text && pin.font
-      ? textCommands(pin.font, pin.text, {
-          x: cx,
-          y: cy + (pin.metrics.capHeight || cfg.textSize * 0.7) / 2,
-          size: cfg.textSize,
-          tracking: cfg.tracking,
-          align: 'middle',
-        })
-      : [];
-  const textData = textCmds.length ? commandsToPathData(textCmds, { decimals: 3 }) : '';
-
-  if (cfg.style === 'dot') {
-    parts.push(`<path d="${circlePathData(cx, cy, cfg.radius, decimals)}" fill="${ink}"/>`);
-    return parts.join('');
-  }
-
-  const shape =
-    cfg.style === 'teardrop'
-      ? teardropPathData(cx, cy, cfg.radius, cfg.stemLength, decimals)
-      : circlePathData(cx, cy, cfg.radius, decimals);
+      ? commandsToPathData(
+          textCommands(pin.font, pin.text, {
+            x: shape.anchorX,
+            y: shape.anchorY + (pin.metrics.capHeight || cfg.textSize * 0.7) / 2 + cfg.textOffsetY,
+            size: cfg.textSize,
+            tracking: cfg.tracking,
+            align: 'middle',
+          }),
+          { decimals: 3 }
+        )
+      : '';
 
   if (cfg.style === 'ring') {
     parts.push(
-      `<path d="${shape}" fill="none" stroke="${ink}" stroke-width="${num(cfg.strokeWidth, 3)}"/>`
+      `<path d="${shape.path}" fill="none" stroke="${ink}" stroke-width="${num(cfg.strokeWidth, 3)}"/>`
     );
     if (textData) parts.push(`<path d="${textData}" fill="${ink}"/>`);
     return parts.join('');
   }
 
-  // Filled marker: knocking the text out of the disc keeps it legible on slate,
-  // where the disc itself is the engraved (light) area.
+  // Filled marker: knocking the text out keeps it legible on slate, where the
+  // marker itself is the engraved (light) area.
   if (textData && cfg.knockout) {
-    parts.push(`<path d="${shape}${textData}" fill="${ink}" fill-rule="evenodd"/>`);
+    parts.push(`<path d="${shape.path}${textData}" fill="${ink}" fill-rule="evenodd"/>`);
   } else {
-    parts.push(`<path d="${shape}" fill="${ink}"/>`);
+    parts.push(`<path d="${shape.path}" fill="${ink}"/>`);
     if (textData) parts.push(`<path d="${textData}" fill="${ink}"/>`);
   }
   return parts.join('');
@@ -187,7 +168,11 @@ function captionMarkup(layout, ink) {
     const font = getLoadedFont(line.font, line.weight, line.italic);
     if (!font) continue;
     const anchor =
-      line.align === 'left' ? layout.caption.left : line.align === 'right' ? layout.caption.right : layout.caption.centerX;
+      (line.align === 'left'
+        ? layout.caption.left
+        : line.align === 'right'
+          ? layout.caption.right
+          : layout.caption.centerX) + (line.offsetX || 0);
     const align = line.align === 'left' ? 'start' : line.align === 'right' ? 'end' : 'middle';
     const baseline =
       layout.caption.top + line.offsetY + line.advance / 2 + (line.metrics.capHeight || line.size * 0.7) / 2;
@@ -298,7 +283,7 @@ export function renderSvg({ state, layout, projection, prepared, labels, pin, mo
   }
 
   if (pin) {
-    const markup = pinMarkup(state, pin, inkFor('pin'), decimals);
+    const markup = pinMarkup(state, pin, inkFor('pin'));
     if (markup) groups.push(`<g id="pin" data-role="pin">${markup}</g>`);
   }
 

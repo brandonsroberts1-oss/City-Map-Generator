@@ -8,6 +8,7 @@ import { LAYERS, LAYER_GROUPS } from './layers.js';
 import { FONTS } from './typography.js';
 import { PREVIEW_THEMES } from './render.js';
 import { COASTER_PRESETS, captionLine } from './state.js';
+import { PIN_STYLES, TEXT_STYLES } from './pinshapes.js';
 
 const FONT_OPTIONS = FONTS.map((f) => ({ value: f.id, label: f.name, fontFamily: `'${f.name}', serif` }));
 const CASE_OPTIONS = [
@@ -169,10 +170,11 @@ export function buildPanel({ store, actions }) {
     bind(segmented({
       label: 'Border encloses',
       options: [
-        { value: 'map', label: 'The map' },
-        { value: 'coaster', label: 'Whole face' },
+        { value: 'map', label: 'Map only', title: 'The frame sits around the map, with the caption below it' },
+        { value: 'coaster', label: 'Map + caption', title: 'The frame runs around the whole face, enclosing the caption too' },
       ],
       value: st().border.scope,
+      hint: 'Map + caption puts the frame around the coaster perimeter, with the place name inside it.',
       onChange: (v) => update((s) => { s.border.scope = v; }),
     }), (s) => s.border.scope),
     bind(slider({
@@ -349,46 +351,33 @@ export function buildPanel({ store, actions }) {
     label: 'Ring thickness', min: 0.1, max: 3, step: 0.05, value: st().pin.strokeWidth, unit: ' mm',
     onInput: (v) => update((s) => { s.pin.strokeWidth = v; }),
   }), (s) => s.pin.strokeWidth);
+  const pinTextFields = el('div', { class: 'sub-body' });
+  const pinStyleHint = el('p', { class: 'field-hint' });
   const syncPinStyle = () => {
-    stemField.hidden = st().pin.style !== 'teardrop';
-    strokeField.hidden = st().pin.style !== 'ring';
+    const style = st().pin.style;
+    stemField.hidden = style !== 'teardrop';
+    strokeField.hidden = style !== 'ring';
+    pinTextFields.hidden = !TEXT_STYLES.has(style);
+    pinStyleHint.textContent = PIN_STYLES.find((p) => p.id === style)?.hint || '';
   };
 
   pinBody.append(
     bind(segmented({
-      label: 'Style',
-      options: [
-        { value: 'disc', label: 'Filled disc' },
-        { value: 'ring', label: 'Ring' },
-        { value: 'teardrop', label: 'Map pin' },
-        { value: 'dot', label: 'Dot' },
-      ],
+      label: 'Shape',
+      wrap: true,
+      options: PIN_STYLES.map((p) => ({ value: p.id, label: p.label, title: p.hint })),
       value: st().pin.style,
       onChange: (v) => { update((s) => { s.pin.style = v; }); syncPinStyle(); },
     }), (s) => s.pin.style),
-    bind(textInput({
-      label: 'Text inside the pin', value: st().pin.text, placeholder: 'Home',
-      onInput: (v) => update((s) => { s.pin.text = v; }),
-    }), (s) => s.pin.text),
-    bind(select({
-      label: 'Pin font', options: FONT_OPTIONS, value: st().pin.font, styleOptions: true,
-      onChange: (v) => update((s) => { s.pin.font = v; }, { fonts: true }),
-    }), (s) => s.pin.font),
-    row([
-      bind(segmented({ label: 'Weight', options: WEIGHT_OPTIONS, value: st().pin.weight, onChange: (v) => update((s) => { s.pin.weight = Number(v); }, { fonts: true }) }), (s) => s.pin.weight),
-      bind(select({ label: 'Capitalisation', options: CASE_OPTIONS, value: st().pin.textCase, onChange: (v) => update((s) => { s.pin.textCase = v; }) }), (s) => s.pin.textCase),
-    ], 'row row-2'),
-    bind(slider({ label: 'Pin size', min: 1, max: 25, step: 0.25, value: st().pin.radius, unit: ' mm', onInput: (v) => update((s) => { s.pin.radius = v; }) }), (s) => s.pin.radius),
-    bind(slider({ label: 'Text size', min: 1, max: 12, step: 0.1, value: st().pin.textSize, unit: ' mm', onInput: (v) => update((s) => { s.pin.textSize = v; }) }), (s) => s.pin.textSize),
-    bind(slider({ label: 'Letter spacing', min: -0.2, max: 1.5, step: 0.02, value: st().pin.tracking, unit: ' mm', onInput: (v) => update((s) => { s.pin.tracking = v; }) }), (s) => s.pin.tracking),
+    pinStyleHint,
+    bind(slider({
+      label: 'Pin size', min: 1, max: 25, step: 0.25, value: st().pin.radius, unit: ' mm',
+      hint: 'A minimum — the shape grows if the text needs more room.',
+      onInput: (v) => update((s) => { s.pin.radius = v; }),
+    }), (s) => s.pin.radius),
     stemField,
     strokeField,
-    bind(toggle({
-      label: 'Knock the text out of the disc',
-      value: st().pin.knockout,
-      hint: 'Leaves the letters unengraved, like the reference coasters.',
-      onChange: (v) => update((s) => { s.pin.knockout = v; }),
-    }), (s) => s.pin.knockout),
+    pinTextFields,
     bind(toggle({
       label: 'Clear the map behind the pin', value: st().pin.clearSpace,
       onChange: (v) => update((s) => { s.pin.clearSpace = v; }),
@@ -405,6 +394,33 @@ export function buildPanel({ store, actions }) {
       bind(numberInput({ label: 'Pin longitude', value: st().pin.lon, step: 0.0001, min: -180, max: 180, onInput: (v) => update((s) => { s.pin.lon = v; s.pin.followCentre = false; }) }), (s) => s.pin.lon),
     ], 'row row-2')
   );
+  pinTextFields.append(
+    bind(textInput({
+      label: 'Text inside the pin', value: st().pin.text, placeholder: 'Home',
+      onInput: (v) => update((s) => { s.pin.text = v; }),
+    }), (s) => s.pin.text),
+    bind(select({
+      label: 'Pin font', options: FONT_OPTIONS, value: st().pin.font, styleOptions: true,
+      onChange: (v) => update((s) => { s.pin.font = v; }, { fonts: true }),
+    }), (s) => s.pin.font),
+    row([
+      bind(segmented({ label: 'Weight', options: WEIGHT_OPTIONS, value: st().pin.weight, onChange: (v) => update((s) => { s.pin.weight = Number(v); }, { fonts: true }) }), (s) => s.pin.weight),
+      bind(select({ label: 'Capitalisation', options: CASE_OPTIONS, value: st().pin.textCase, onChange: (v) => update((s) => { s.pin.textCase = v; }) }), (s) => s.pin.textCase),
+    ], 'row row-2'),
+    bind(slider({ label: 'Text size', min: 1, max: 12, step: 0.1, value: st().pin.textSize, unit: ' mm', onInput: (v) => update((s) => { s.pin.textSize = v; }) }), (s) => s.pin.textSize),
+    bind(slider({ label: 'Letter spacing', min: -0.2, max: 1.5, step: 0.02, value: st().pin.tracking, unit: ' mm', onInput: (v) => update((s) => { s.pin.tracking = v; }) }), (s) => s.pin.tracking),
+    bind(slider({
+      label: 'Nudge text up or down', min: -8, max: 8, step: 0.1, value: st().pin.textOffsetY, unit: ' mm',
+      onInput: (v) => update((s) => { s.pin.textOffsetY = v; }),
+    }), (s) => s.pin.textOffsetY),
+    bind(toggle({
+      label: 'Knock the text out of the shape',
+      value: st().pin.knockout,
+      hint: 'Leaves the letters unengraved, like the reference coasters.',
+      onChange: (v) => update((s) => { s.pin.knockout = v; }),
+    }), (s) => s.pin.knockout)
+  );
+
   syncPinStyle();
   bindings.push({ node: { sync: syncPinStyle }, read: () => null });
 
@@ -467,7 +483,8 @@ export function buildPanel({ store, actions }) {
         select({ label: 'Capitalisation', options: CASE_OPTIONS, value: line.textCase, onChange: (v) => update((s) => { s.caption.lines[index].textCase = v; }) }),
         slider({ label: 'Size', min: 1.5, max: 24, step: 0.1, value: line.size, unit: ' mm', onInput: (v) => update((s) => { s.caption.lines[index].size = v; }) }),
         slider({ label: 'Letter spacing', min: -0.3, max: 2, step: 0.02, value: line.tracking, unit: ' mm', onInput: (v) => update((s) => { s.caption.lines[index].tracking = v; }) }),
-        slider({ label: 'Line spacing', min: 0.9, max: 2.5, step: 0.02, value: line.lineHeight, format: (v) => `${v.toFixed(2)}×`, onInput: (v) => update((s) => { s.caption.lines[index].lineHeight = v; }) })
+        slider({ label: 'Line spacing', min: 0.9, max: 2.5, step: 0.02, value: line.lineHeight, format: (v) => `${v.toFixed(2)}×`, onInput: (v) => update((s) => { s.caption.lines[index].lineHeight = v; }) }),
+        slider({ label: 'Nudge this line sideways', min: -40, max: 40, step: 0.25, value: line.offsetX, unit: ' mm', onInput: (v) => update((s) => { s.caption.lines[index].offsetX = v; }) })
       );
       linesHost.append(card);
     });
@@ -488,6 +505,23 @@ export function buildPanel({ store, actions }) {
       label: 'Gap below the map', min: 0, max: 25, step: 0.25, value: st().caption.gap, unit: ' mm',
       onInput: (v) => update((s) => { s.caption.gap = v; }),
     }), (s) => s.caption.gap),
+    el('p', { class: 'field-hint', text: 'Drag the caption in the preview to move it, or nudge it here.' }),
+    row([
+      bind(slider({
+        label: 'Move left / right', min: -40, max: 40, step: 0.25, value: st().caption.offsetX, unit: ' mm',
+        onInput: (v) => update((s) => { s.caption.offsetX = v; }),
+      }), (s) => s.caption.offsetX),
+      bind(slider({
+        label: 'Move up / down', min: -60, max: 40, step: 0.25, value: st().caption.offsetY, unit: ' mm',
+        onInput: (v) => update((s) => { s.caption.offsetY = v; }),
+      }), (s) => s.caption.offsetY),
+    ], 'row row-2'),
+    row([
+      button({
+        label: 'Centre the caption',
+        onClick: () => update((s) => { s.caption.offsetX = 0; s.caption.offsetY = 0; }),
+      }),
+    ]),
     linesHost,
     row([
       button({
@@ -547,18 +581,24 @@ export function buildPanel({ store, actions }) {
       button({ label: 'Download SVG', variant: 'primary', onClick: () => actions.exportSvg() }),
       button({ label: 'Save design', onClick: () => actions.saveDesign() }),
     ]),
-    row([
-      button({ label: 'Open design', onClick: () => fileInput.click() }),
-      button({ label: 'Start over', onClick: () => actions.reset() }),
-    ]),
+    row([button({ label: 'Open design', onClick: () => fileInput.click() })]),
     fileInput,
     statsNode
   );
 
-  panel.append(locationSection, coasterSection, layersSection, labelsSection, pinSection, captionSection, exportSection);
+  const undoButton = button({ label: '↶ Undo', title: 'Undo the last change (Ctrl/Cmd+Z)', onClick: () => actions.undo() });
+  const redoButton = button({ label: '↷ Redo', title: 'Redo (Ctrl/Cmd+Shift+Z)', onClick: () => actions.redo() });
+  const resetButton = button({ label: 'Reset to defaults', title: 'Discard every setting and start from the default design', onClick: () => actions.reset() });
+  const toolbar = el('div', { class: 'panel-toolbar' }, [undoButton, redoButton, resetButton]);
+
+  panel.append(toolbar, locationSection, coasterSection, layersSection, labelsSection, pinSection, captionSection, exportSection);
 
   return {
     node: panel,
+    setHistoryState(canUndo, canRedo) {
+      undoButton.disabled = !canUndo;
+      redoButton.disabled = !canRedo;
+    },
     renderResults,
     renderCaptionLines,
     setStats(text) { statsNode.textContent = text; },

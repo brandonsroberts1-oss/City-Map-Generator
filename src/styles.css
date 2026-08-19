@@ -105,6 +105,8 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 }
 .preview.is-dragging { cursor: grabbing; }
 .preview.is-placing { cursor: crosshair; }
+.preview.is-over-caption { cursor: move; }
+.preview.is-moving-caption { cursor: grabbing; }
 .preview svg {
   width: 100%;
   height: auto;
@@ -154,7 +156,23 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
   overscroll-behavior: contain;
   min-height: 0;
 }
-.panel { padding: 4px 0 48px; }
+.panel { padding: 0 0 48px; }
+
+/* Undo / redo / reset sit above the sections so they are reachable from
+   anywhere in the panel without scrolling back to the export section. */
+.panel-toolbar {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 2;
+  display: flex;
+  gap: 6px;
+  padding: 10px 18px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--line);
+}
+.panel-toolbar .btn { flex: 1 1 auto; padding: 7px 8px; font-size: 12.5px; }
+.btn:disabled { opacity: 0.42; cursor: default; }
+.btn:disabled:hover { background: var(--bg-sunken); border-color: var(--line); }
 
 .section { border-bottom: 1px solid var(--line-soft); }
 .section-summary {
@@ -295,6 +313,9 @@ select.input { cursor: pointer; appearance: none; padding-right: 28px;
   background: var(--bg-sunken);
   border: 1px solid var(--line);
 }
+.segmented.is-wrap { flex-wrap: wrap; }
+.segmented.is-wrap .segment { flex: 0 1 calc(33.333% - 3px); min-width: 74px; }
+
 .segment {
   flex: 1 1 0;
   padding: 6px 8px;

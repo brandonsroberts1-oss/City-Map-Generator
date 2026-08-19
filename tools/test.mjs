@@ -53,6 +53,7 @@ const layoutMod = await import('../src/layout.js');
 const prepareMod = await import('../src/prepare.js');
 const knockoutMod = await import('../src/knockouts.js');
 const labelsMod = await import('../src/labels.js');
+const pinshapes = await import('../src/pinshapes.js');
 const renderMod = await import('../src/render.js');
 const exportMod = await import('../src/export.js');
 
@@ -276,17 +277,25 @@ group('render pipeline (demo fixture)');
   check('labels stay upright', labels.every((l) => Math.abs(l.angle) <= 90 + 1e-9));
 
   const knockouts = knockoutMod.buildKnockouts({ state, pin, labels, worldBounds: layout.clip.bounds });
-  check('a knockout exists for the pin and each label', knockouts.length === labels.length + 1);
+  check('a knockout exists for every pin piece and every label',
+    knockouts.length === labels.length + pin.shape.pieces.length);
   prepareMod.applyKnockouts(prepared.byLayer, knockouts);
 
-  // Nothing may survive inside the pin disc.
-  const rSq = (state.pin.radius + state.pin.clearance) ** 2;
+  // Nothing may survive inside the marker itself.
+  const insideShape = (x, y) => {
+    const b = pin.shape.box;
+    if (x < b.minX || x > b.maxX || y < b.minY || y > b.maxY) return false;
+    // Inside the drawn outline is approximated by its inscribed disc, which is
+    // enough to catch a knockout that failed to fire.
+    const rIn = Math.min(b.maxX - b.minX, b.maxY - b.minY) / 2 - 0.05;
+    const cxs = (b.minX + b.maxX) / 2;
+    const cys = (b.minY + b.maxY) / 2;
+    return (x - cxs) ** 2 + (y - cys) ** 2 < rIn * rIn;
+  };
   let insidePin = 0;
   for (const bucket of prepared.byLayer.values()) {
     for (const geom of [...bucket.lines, ...bucket.outlines, ...bucket.areas.flatMap((a) => a.outers)]) {
-      for (const [x, y] of geom) {
-        if ((x - pin.x) ** 2 + (y - pin.headY) ** 2 < rSq - 1e-3) insidePin++;
-      }
+      for (const [x, y] of geom) if (insideShape(x, y)) insidePin++;
     }
   }
   check('the pin sits on genuinely clear slate', insidePin === 0, `${insidePin} points inside the pin`);
@@ -310,6 +319,98 @@ group('render pipeline (demo fixture)');
   check('per-layer export uses several colours', colours.size >= 5, `${colours.size} distinct`);
 }
 
+// ---------------------------------------------------------------- pin shapes
+group('pin shapes');
+{
+  for (const style of pinshapes.PIN_STYLES) {
+    const shape = pinshapes.buildPinShape(style.id, {
+      cx: 50, cy: 50, radius: 8, stemLength: 5, textWidth: 22, grow: 0.8,
+    });
+    const points = shape.pieces.flat();
+    const bad =
+      /NaN|Infinity/.test(shape.path) ||
+      points.some(([x, y]) => !Number.isFinite(x) || !Number.isFinite(y));
+    check(`${style.id} produces finite geometry`, !bad);
+    check(`${style.id} has a drawable path`, shape.path.startsWith('M') && shape.path.length > 20);
+    check(`${style.id} has at least one convex knockout piece`, shape.pieces.length >= 1);
+  }
+
+  // The knockout has to cover the drawn shape, or a hairline of street survives
+  // under its edge and fills in the knocked-out letters.
+  const covered = (style, samples = 400) => {
+    const tight = pinshapes.buildPinShape(style, { cx: 0, cy: 0, radius: 10, stemLength: 6, textWidth: 24, grow: 0 });
+    const grown = pinshapes.buildPinShape(style, { cx: 0, cy: 0, radius: 10, stemLength: 6, textWidth: 24, grow: 0.6 });
+    const rings = grown.pieces;
+    let misses = 0;
+    for (let i = 0; i < samples; i++) {
+      // Sample the tight shape's own bounding box, keeping points that the
+      // un-grown pieces already claim, then require the grown ones to hold them.
+      const t = i / samples;
+      const x = tight.box.minX + (tight.box.maxX - tight.box.minX) * ((i * 7919) % samples) / samples;
+      const y = tight.box.minY + (tight.box.maxY - tight.box.minY) * t;
+      const inTight = tight.pieces.some((ring) => clip.pointInRing([x, y], ring));
+      if (!inTight) continue;
+      if (!rings.some((ring) => clip.pointInRing([x, y], ring))) misses++;
+    }
+    return misses;
+  };
+  for (const style of ['disc', 'oval', 'pill', 'heart', 'teardrop']) {
+    check(`${style} knockout covers the drawn shape`, covered(style) === 0, `${covered(style)} uncovered samples`);
+  }
+
+  const narrow = pinshapes.buildPinShape('oval', { cx: 0, cy: 0, radius: 6, textWidth: 0 });
+  const wide = pinshapes.buildPinShape('oval', { cx: 0, cy: 0, radius: 6, textWidth: 40 });
+  check('oval stretches to hold longer text', wide.box.maxX - wide.box.minX > narrow.box.maxX - narrow.box.minX);
+  check('oval keeps its height when it stretches',
+    near(wide.box.maxY - wide.box.minY, narrow.box.maxY - narrow.box.minY, 1e-9));
+  const pill = pinshapes.buildPinShape('pill', { cx: 0, cy: 0, radius: 6, textWidth: 40 });
+  check('pill stretches too', pill.box.maxX - pill.box.minX > 40);
+  const disc = pinshapes.buildPinShape('disc', { cx: 0, cy: 0, radius: 6, textWidth: 40 });
+  check('disc grows whole rather than stretching',
+    near(disc.box.maxX - disc.box.minX, disc.box.maxY - disc.box.minY, 1e-9) &&
+      disc.box.maxX - disc.box.minX > 40);
+  const smallDisc = pinshapes.buildPinShape('disc', { cx: 0, cy: 0, radius: 6, textWidth: 0 });
+  check('disc keeps the requested size when the text fits',
+    near(smallDisc.box.maxX - smallDisc.box.minX, 12, 1e-9));
+  const bigHeart = pinshapes.buildPinShape('heart', { cx: 0, cy: 0, radius: 4, textWidth: 30 });
+  check('heart grows to hold a long word', bigHeart.box.maxX - bigHeart.box.minX > 30);
+  check('minRadiusForText leaves stretchy styles alone', pinshapes.minRadiusForText('oval', 40) === 0);
+  check('map pin hangs below the point it marks', pinshapes.pinHeadOffset('teardrop', 8, 5) === -13);
+  check('other shapes sit on the point', pinshapes.pinHeadOffset('disc', 8, 5) === 0);
+
+  const heart = pinshapes.buildPinShape('heart', { cx: 0, cy: 0, radius: 10 });
+  check('heart is wider than it is tall at the lobes', heart.box.maxX - heart.box.minX >= 19.9);
+  check('heart anchors its text above centre', heart.anchorY < 0);
+  check('dot is not offered text', !pinshapes.TEXT_STYLES.has('dot'));
+  check('oval is offered text', pinshapes.TEXT_STYLES.has('oval'));
+}
+
+// ----------------------------------------------------------- caption offsets
+group('caption placement');
+{
+  const base = stateMod.createDefaultState();
+  const plain = layoutMod.computeLayout(base);
+  const moved = stateMod.createDefaultState();
+  moved.caption.offsetX = 6;
+  moved.caption.offsetY = -4;
+  const shifted = layoutMod.computeLayout(moved);
+  check('caption offset moves the caption', near(shifted.caption.top, plain.caption.top - 4, 1e-9) &&
+    near(shifted.caption.centerX, plain.caption.centerX + 6, 1e-9));
+  check('caption offset leaves the map window alone',
+    near(shifted.mapBox.h, plain.mapBox.h, 1e-9) && near(shifted.mapBox.y, plain.mapBox.y, 1e-9));
+  check('caption exposes a grab box', plain.caption.box.maxX > plain.caption.box.minX && plain.caption.hasText);
+  check('grab box tracks the offset', near(shifted.caption.box.minX, plain.caption.box.minX + 6, 1e-9));
+
+  const nudged = stateMod.createDefaultState();
+  nudged.caption.lines[1].offsetX = 5;
+  const perLine = layoutMod.computeLayout(nudged);
+  check('a single line can be nudged sideways', perLine.caption.box.maxX > plain.caption.box.maxX);
+
+  const empty = stateMod.createDefaultState();
+  empty.caption.lines = [];
+  check('an empty caption has no grab box', layoutMod.computeLayout(empty).caption.hasText === false);
+}
+
 // -------------------------------------------------------------- state & files
 group('state and files');
 {
@@ -325,12 +426,24 @@ group('state and files');
 
   const store = stateMod.createStore(fresh);
   let seen = 0;
-  const off = store.subscribe(() => seen++);
+  let lastMeta = null;
+  const off = store.subscribe((_, meta) => { seen++; lastMeta = meta; });
   store.set((s) => { s.pin.text = 'Home sweet home'; });
   check('store notifies subscribers', seen === 1 && store.get().pin.text === 'Home sweet home');
+  check('tracked changes carry the previous state for undo',
+    lastMeta.before?.pin.text === 'Home' && store.get().pin.text === 'Home sweet home');
+  store.set((s) => { s.pin.text = 'y'; }, { track: false });
+  check('untracked changes carry no history entry', lastMeta.before === null);
+  store.set((s) => { s.location.query = 'typing'; }, { silent: true });
+  check('silent changes carry no history entry', lastMeta.before === null);
   off();
   store.set((s) => { s.pin.text = 'x'; });
-  check('unsubscribe stops notifications', seen === 1);
+  check('unsubscribe stops notifications', seen === 3);
+  check('snapshot is a deep copy', (() => {
+    const snap = stateMod.snapshot(store.get());
+    snap.caption.lines[0].text = 'changed';
+    return store.get().caption.lines[0].text !== 'changed';
+  })());
 }
 
 // -------------------------------------------------------------------- browser
@@ -370,10 +483,30 @@ if (!process.argv.includes('--no-browser')) {
     const labelCount = await page.evaluate(() => document.querySelectorAll('#labels path').length);
     check('labels appear in the preview', labelCount > 5, `${labelCount} label paths`);
 
-    await page.getByRole('button', { name: 'Map pin', exact: true }).click();
+    // Every marker shape has to survive a round trip through the real renderer.
+    for (const shape of ['Disc', 'Oval', 'Pill', 'Heart', 'Map pin', 'Ring', 'Dot']) {
+      await page.getByRole('button', { name: shape, exact: true }).click();
+      await page.waitForTimeout(220);
+      const paths = await page.locator('#pin path').count();
+      const d = await page.locator('#pin path').first().getAttribute('d');
+      check(`${shape} marker renders`, paths > 0 && !!d && !/NaN/.test(d));
+    }
+    await page.getByRole('button', { name: 'Oval', exact: true }).click();
     await page.locator('input[placeholder="Home"]').fill('Family');
     await page.waitForTimeout(400);
-    check('pin renders after edits', (await page.locator('#pin path').count()) > 0);
+
+    // The oval is the reference-photo shape: it should hug a longer word.
+    const ovalWidth = async () => {
+      const d = await page.locator('#pin path').first().getAttribute('d');
+      const xs = [...d.matchAll(/-?\d+(?:\.\d+)?/g)].map(Number).filter((_, i) => i % 2 === 0);
+      return Math.max(...xs) - Math.min(...xs);
+    };
+    const shortWord = await ovalWidth();
+    await page.locator('input[placeholder="Home"]').fill('Grandma and Grandpa');
+    await page.waitForTimeout(400);
+    check('the oval grows to fit a longer word', (await ovalWidth()) > shortWord);
+    await page.locator('input[placeholder="Home"]').fill('Family');
+    await page.waitForTimeout(300);
 
     await page.getByRole('button', { name: 'Add a line' }).click();
     await page.waitForTimeout(300);
@@ -396,6 +529,97 @@ if (!process.argv.includes('--no-browser')) {
     const after = await page.evaluate(() => JSON.parse(localStorage.getItem('city-map-coaster:design:v1')));
     check('dragging pans the map', after.location.lat !== before.location.lat);
     check('the design persists to localStorage', Boolean(after.coaster));
+
+    // --- border around the whole face, caption included
+    await page.getByRole('button', { name: 'Map + caption', exact: true }).click();
+    await page.waitForTimeout(350);
+    const wholeFaceBorder = await page.locator('#border path').getAttribute('d');
+    await page.getByRole('button', { name: 'Map only', exact: true }).click();
+    await page.waitForTimeout(350);
+    const mapOnlyBorder = await page.locator('#border path').getAttribute('d');
+    const height = (d) => {
+      const ys = [...d.matchAll(/-?\d+(?:\.\d+)?/g)].map(Number).filter((_, i) => i % 2 === 1);
+      return Math.max(...ys) - Math.min(...ys);
+    };
+    check('the border can enclose the caption too', height(wholeFaceBorder) > height(mapOnlyBorder) + 5);
+
+    // --- dragging the caption moves only the caption
+    const captionBefore = await page.evaluate(() => document.querySelector('#caption path').getAttribute('d'));
+    const mapBefore = await page.evaluate(() => document.querySelector('#layer-residential path').getAttribute('d'));
+    const captionPoint = await page.evaluate(() => {
+      const svg = document.querySelector('#preview svg');
+      const box = svg.getBoundingClientRect();
+      const caption = document.querySelector('#caption').getBoundingClientRect();
+      return { x: caption.left + caption.width / 2, y: caption.top + caption.height / 2, ok: box.width > 0 };
+    });
+    await page.mouse.move(captionPoint.x, captionPoint.y);
+    await page.mouse.down();
+    await page.mouse.move(captionPoint.x + 40, captionPoint.y - 12, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForTimeout(350);
+    const captionAfter = await page.evaluate(() => document.querySelector('#caption path').getAttribute('d'));
+    const mapAfter = await page.evaluate(() => document.querySelector('#layer-residential path').getAttribute('d'));
+    check('dragging the caption moves it', captionBefore !== captionAfter);
+    check('dragging the caption leaves the map alone', mapBefore === mapAfter);
+
+    // --- undo and redo
+    const offsetNow = await page.evaluate(() => JSON.parse(localStorage.getItem('city-map-coaster:design:v1')).caption.offsetX);
+    check('the caption offset was recorded', Math.abs(offsetNow) > 1);
+    await page.getByRole('button', { name: /Undo/ }).click();
+    await page.waitForTimeout(350);
+    const offsetUndone = await page.evaluate(() => JSON.parse(localStorage.getItem('city-map-coaster:design:v1')).caption.offsetX);
+    check('undo reverts the caption move', Math.abs(offsetUndone) < Math.abs(offsetNow));
+    await page.getByRole('button', { name: /Redo/ }).click();
+    await page.waitForTimeout(350);
+    const offsetRedone = await page.evaluate(() => JSON.parse(localStorage.getItem('city-map-coaster:design:v1')).caption.offsetX);
+    check('redo puts it back', Math.abs(offsetRedone - offsetNow) < 0.01);
+
+    await page.keyboard.press('Control+z');
+    await page.waitForTimeout(300);
+    check('ctrl+z undoes too',
+      Math.abs(await page.evaluate(() => JSON.parse(localStorage.getItem('city-map-coaster:design:v1')).caption.offsetX)) < Math.abs(offsetNow));
+    await page.getByRole('button', { name: /Redo/ }).click();
+    await page.waitForTimeout(250);
+
+    // --- searching a place fills the caption without any typing
+    await page.route('**/nominatim.openstreetmap.org/**', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify([
+          {
+            lat: '39.9943', lon: '-76.7298',
+            display_name: 'York, York County, Pennsylvania, United States',
+            boundingbox: ['39.9', '40.1', '-76.8', '-76.6'],
+            address: { city: 'York', state: 'Pennsylvania', country: 'United States' },
+          },
+        ]),
+      })
+    );
+    await page.locator('input[placeholder="e.g. York, Pennsylvania"]').fill('York PA');
+    await page.getByRole('button', { name: 'Search', exact: true }).click();
+    await page.waitForSelector('.result', { timeout: 10000 });
+    await page.locator('.result').first().click();
+    await page.waitForTimeout(700);
+    const captionLines = await page.evaluate(() =>
+      [...document.querySelectorAll('.caption-line input[type=text]')].map((i) => i.value)
+    );
+    check('searching fills the place name', captionLines[0] === 'York, Pennsylvania', captionLines.join(' | '));
+    check('searching fills the coordinates',
+      captionLines[1] === '39.9943° N, 76.7298° W', captionLines.join(' | '));
+    const centred = await page.evaluate(() => JSON.parse(localStorage.getItem('city-map-coaster:design:v1')).location);
+    check('searching recentres the map', Math.abs(centred.lat - 39.9943) < 1e-6);
+
+    // --- reset, and undo of reset
+    page.once('dialog', (d) => d.accept());
+    await page.getByRole('button', { name: 'Reset to defaults' }).click();
+    await page.waitForTimeout(500);
+    const afterReset = await page.evaluate(() => JSON.parse(localStorage.getItem('city-map-coaster:design:v1')));
+    check('reset restores the defaults', afterReset.caption.offsetX === 0 && afterReset.pin.text === 'Home');
+    await page.getByRole('button', { name: /Undo/ }).click();
+    await page.waitForTimeout(400);
+    const afterUndoReset = await page.evaluate(() => JSON.parse(localStorage.getItem('city-map-coaster:design:v1')));
+    check('reset itself can be undone', afterUndoReset.pin.text === 'Family');
 
     const download = await Promise.all([
       page.waitForEvent('download'),

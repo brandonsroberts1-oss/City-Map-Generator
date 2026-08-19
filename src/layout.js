@@ -4,6 +4,7 @@
 
 import { roundedRectPolygon, ellipsePolygon, convexClipEdges } from './clip.js';
 import { measureText, getLoadedFont, applyTextCase } from './typography.js';
+import { roundedRectPath, ellipsePath } from './paths.js';
 
 function deflate(rect, amount) {
   return {
@@ -12,29 +13,6 @@ function deflate(rect, amount) {
     w: Math.max(0.01, rect.w - amount * 2),
     h: Math.max(0.01, rect.h - amount * 2),
   };
-}
-
-function roundedRectPath(rect, radius) {
-  const r = Math.max(0, Math.min(radius, Math.min(rect.w, rect.h) / 2));
-  const { x, y, w, h } = rect;
-  const f = (n) => Number(n.toFixed(3));
-  if (r < 0.001) return `M${f(x)} ${f(y)}H${f(x + w)}V${f(y + h)}H${f(x)}Z`;
-  return (
-    `M${f(x + r)} ${f(y)}` +
-    `H${f(x + w - r)}A${f(r)} ${f(r)} 0 0 1 ${f(x + w)} ${f(y + r)}` +
-    `V${f(y + h - r)}A${f(r)} ${f(r)} 0 0 1 ${f(x + w - r)} ${f(y + h)}` +
-    `H${f(x + r)}A${f(r)} ${f(r)} 0 0 1 ${f(x)} ${f(y + h - r)}` +
-    `V${f(y + r)}A${f(r)} ${f(r)} 0 0 1 ${f(x + r)} ${f(y)}Z`
-  );
-}
-
-function ellipsePath(cx, cy, rx, ry) {
-  const f = (n) => Number(n.toFixed(3));
-  return (
-    `M${f(cx - rx)} ${f(cy)}` +
-    `A${f(rx)} ${f(ry)} 0 0 1 ${f(cx + rx)} ${f(cy)}` +
-    `A${f(rx)} ${f(ry)} 0 0 1 ${f(cx - rx)} ${f(cy)}Z`
-  );
 }
 
 /** Intersects several convex regions by concatenating their half-planes. */
@@ -79,6 +57,39 @@ export function measureCaption(caption) {
     total += advance;
   }
   return { lines, height: total };
+}
+
+/**
+ * Assembles the caption block and the box a pointer has to be inside to grab it.
+ *
+ * The block's position already carries the user's nudge, but the map window is
+ * measured from the un-nudged position, so dragging the caption moves only the
+ * caption.
+ */
+function buildCaptionBlock(metrics, placement) {
+  const { top, centerX, left, right } = placement;
+  let minX = Infinity;
+  let maxX = -Infinity;
+  for (const line of metrics.lines) {
+    const anchor = line.align === 'left' ? left : line.align === 'right' ? right : centerX;
+    const offset = line.offsetX || 0;
+    const start =
+      line.align === 'left' ? anchor : line.align === 'right' ? anchor - line.metrics.width : anchor - line.metrics.width / 2;
+    minX = Math.min(minX, start + offset);
+    maxX = Math.max(maxX, start + offset + line.metrics.width);
+  }
+  const hasText = metrics.lines.length > 0;
+  return {
+    ...metrics,
+    top,
+    centerX,
+    left,
+    right,
+    box: hasText
+      ? { minX, maxX, minY: top, maxY: top + metrics.height }
+      : { minX: 0, maxX: 0, minY: 0, maxY: 0 },
+    hasText,
+  };
 }
 
 /**
@@ -231,13 +242,12 @@ export function computeLayout(state) {
     clipPathD,
     borderPath,
     borderWidth: border.thickness,
-    caption: {
-      ...captionMetrics,
-      top: captionTop,
-      centerX: isCircle ? centreX : inner.x + inner.w / 2,
-      left: captionLeft,
-      right: captionRight,
-    },
+    caption: buildCaptionBlock(captionMetrics, {
+      top: captionTop + caption.offsetY,
+      centerX: (isCircle ? centreX : inner.x + inner.w / 2) + caption.offsetX,
+      left: captionLeft + caption.offsetX,
+      right: captionRight + caption.offsetX,
+    }),
     cutPath,
   };
 }
