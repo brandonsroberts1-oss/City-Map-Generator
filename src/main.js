@@ -209,6 +209,7 @@ async function loadDemo() {
       s.location = { query: 'Sample City', lat: centre.lat, lon: centre.lon, label: 'Sample City', region: 'Ohio' };
       s.view.spanMetres = 6000;
       fillCaption(s);
+      movePinToCentre(s);
     });
     panel.renderCaptionLines();
     setBusy(false);
@@ -217,6 +218,13 @@ async function loadDemo() {
     setBusy(false);
     setStatus(`Could not load the demo city: ${err.message}`, 'error', true);
   }
+}
+
+// ----------------------------------------------------------------------- pin
+/** Parks the pin on the current map centre. */
+function movePinToCentre(state) {
+  state.pin.lat = state.location.lat;
+  state.pin.lon = state.location.lon;
 }
 
 // ------------------------------------------------------------------- caption
@@ -251,7 +259,25 @@ function buildFrame(state, mode) {
     : [];
   applyKnockouts(prepared.byLayer, buildKnockouts({ state, pin, labels, worldBounds: layout.clip.bounds }));
   const { markup, stats } = renderSvg({ state, layout, projection, prepared, labels, pin, mode });
-  return { markup, stats, layout, projection, labelCount: labels.length };
+  return { markup, stats, layout, projection, pin, labelCount: labels.length };
+}
+
+/**
+ * Whether the pin would land inside the map window right now.
+ *
+ * Computed fresh rather than remembered from the last frame: the question is
+ * asked precisely when the pin was switched off and so was not in that frame.
+ */
+function pinWouldBeVisible(state) {
+  const layout = computeLayout(state);
+  const projection = createProjection({
+    lat: state.location.lat,
+    lon: state.location.lon,
+    spanMetres: state.view.spanMetres,
+    rect: layout.projectionRect,
+  });
+  const pin = computePin({ ...state, pin: { ...state.pin, enabled: true } }, layout, projection);
+  return Boolean(pin?.onMap);
 }
 
 function render() {
@@ -269,6 +295,8 @@ function render() {
       svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
     }
     panel.sync();
+    panel.setCaptionHeight(frame.layout.caption.height);
+    panel.setPinWarning(Boolean(frame.pin) && !frame.pin.onMap);
     const ms = Math.round(performance.now() - started);
     panel.setStats(
       `${state.coaster.width} × ${state.coaster.shape === 'circle' ? state.coaster.width : state.coaster.height} mm · ` +
@@ -463,10 +491,9 @@ const actions = {
       // Choosing a search result is an explicit "I want this place", so the
       // caption is always rewritten — that is the whole point of searching.
       fillCaption(s);
-      if (s.pin.followCentre) {
-        s.pin.lat = result.lat;
-        s.pin.lon = result.lon;
-      }
+      // A pin left behind in the previous city is never what someone wants
+      // after searching a new one, whether or not it is set to follow.
+      movePinToCentre(s);
     }, { refetch: true });
     panel.renderCaptionLines();
     panel.sync();
@@ -484,6 +511,31 @@ const actions = {
 
   togglePlacePin() {
     setPlacingPin(!placingPin);
+  },
+
+  /**
+   * Turning the pin on has to actually show something. If its saved
+   * coordinates are outside the current view — after a search, a zoom, or a
+   * design restored from another city — it is moved to the centre rather than
+   * drawn somewhere off the coaster.
+   */
+  setPinEnabled(enabled) {
+    store.set((s) => {
+      s.pin.enabled = enabled;
+      if (enabled && !pinWouldBeVisible(s)) movePinToCentre(s);
+    });
+    if (enabled && !store.get().pin.followCentre) {
+      setStatus('Pin shown at the map centre. Drag it into place with “Click the preview to place”.', 'ok');
+    }
+  },
+
+  centrePin() {
+    store.set((s) => {
+      s.pin.enabled = true;
+      movePinToCentre(s);
+    });
+    panel.sync();
+    setStatus('Pin moved to the middle of the map.', 'ok');
   },
 
   undo,

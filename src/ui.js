@@ -44,7 +44,7 @@ export function buildPanel({ store, actions }) {
   const update = (mutator, meta) => store.set(mutator, meta);
 
   // ------------------------------------------------------------- location
-  const locationSection = section('Location', { open: true });
+  const locationSection = section('Location', { open: true, id: 'section-location' });
   const searchField = textInput({
     label: 'City, address or coordinates',
     value: st().location.query,
@@ -109,7 +109,7 @@ export function buildPanel({ store, actions }) {
   }
 
   // -------------------------------------------------------------- coaster
-  const coasterSection = section('Coaster & frame');
+  const coasterSection = section('Coaster & frame', { id: 'section-coaster' });
   const cornerField = bind(slider({
     label: 'Coaster corner radius', min: 0, max: 30, step: 0.5, value: st().coaster.cornerRadius, unit: ' mm',
     onInput: (v) => update((s) => { s.coaster.cornerRadius = v; }),
@@ -208,7 +208,7 @@ export function buildPanel({ store, actions }) {
   );
 
   // --------------------------------------------------------------- layers
-  const layersSection = section('Map layers & line weights', { open: true });
+  const layersSection = section('Map layers & line weights', { open: true, id: 'section-layers' });
   for (const groupName of LAYER_GROUPS) {
     const groupLayers = LAYERS.filter((l) => l.group === groupName).sort((a, b) => b.order - a.order);
     if (!groupLayers.length) continue;
@@ -280,7 +280,7 @@ export function buildPanel({ store, actions }) {
   );
 
   // --------------------------------------------------------------- labels
-  const labelsSection = section('Street & place labels');
+  const labelsSection = section('Street & place labels', { id: 'section-labels' });
   const labelBody = el('div', { class: 'sub-body' });
   labelsSection.body.append(
     bind(toggle({
@@ -327,8 +327,12 @@ export function buildPanel({ store, actions }) {
   );
 
   // ------------------------------------------------------------------ pin
-  const pinSection = section('Location pin');
+  const pinSection = section('Location pin', { id: 'section-pin' });
   const pinBody = el('div', { class: 'sub-body' });
+  const pinWarning = el('div', { class: 'notice', hidden: true }, [
+    el('p', { class: 'notice-text', text: 'The pin is sitting outside the map window, so it is not visible.' }),
+    button({ label: 'Bring the pin to the map centre', onClick: () => actions.centrePin() }),
+  ]);
   const placeButton = button({
     label: 'Click the preview to place',
     onClick: () => actions.togglePlacePin(),
@@ -336,8 +340,9 @@ export function buildPanel({ store, actions }) {
   pinSection.body.append(
     bind(toggle({
       label: 'Show a pin', value: st().pin.enabled,
-      onChange: (v) => { pinBody.hidden = !v; update((s) => { s.pin.enabled = v; }); },
+      onChange: (v) => { pinBody.hidden = !v; actions.setPinEnabled(v); },
     }), (s) => s.pin.enabled),
+    pinWarning,
     pinBody
   );
   pinBody.hidden = !st().pin.enabled;
@@ -388,7 +393,10 @@ export function buildPanel({ store, actions }) {
       label: 'Keep the pin at the map centre', value: st().pin.followCentre,
       onChange: (v) => update((s) => { s.pin.followCentre = v; }),
     }), (s) => s.pin.followCentre),
-    row([placeButton]),
+    row([
+      placeButton,
+      button({ label: 'Centre it', title: 'Move the pin to the middle of the map', onClick: () => actions.centrePin() }),
+    ]),
     row([
       bind(numberInput({ label: 'Pin latitude', value: st().pin.lat, step: 0.0001, min: -85, max: 85, onInput: (v) => update((s) => { s.pin.lat = v; s.pin.followCentre = false; }) }), (s) => s.pin.lat),
       bind(numberInput({ label: 'Pin longitude', value: st().pin.lon, step: 0.0001, min: -180, max: 180, onInput: (v) => update((s) => { s.pin.lon = v; s.pin.followCentre = false; }) }), (s) => s.pin.lon),
@@ -425,7 +433,7 @@ export function buildPanel({ store, actions }) {
   bindings.push({ node: { sync: syncPinStyle }, read: () => null });
 
   // -------------------------------------------------------------- caption
-  const captionSection = section('Caption', { open: true });
+  const captionSection = section('Caption', { open: true, id: 'section-caption' });
   const captionBody = el('div', { class: 'sub-body' });
   const linesHost = el('div', { class: 'caption-lines' });
 
@@ -500,7 +508,16 @@ export function buildPanel({ store, actions }) {
   captionBody.hidden = !st().caption.enabled;
   bindings.push({ node: { sync: () => { captionBody.hidden = !st().caption.enabled; } }, read: () => null });
 
+  const captionHeightNote = el('p', { class: 'field-hint', id: 'caption-height-note' });
+  const captionScaleField = slider({
+    label: 'Overall caption size', min: 0.35, max: 2, step: 0.01, value: st().caption.scale,
+    format: (v) => `${v.toFixed(2)}×`,
+    onInput: (v) => update((s) => { s.caption.scale = v; }),
+  });
+  captionScaleField.id = 'caption-scale';
   captionBody.append(
+    bind(captionScaleField, (s) => s.caption.scale),
+    captionHeightNote,
     bind(slider({
       label: 'Gap below the map', min: 0, max: 25, step: 0.25, value: st().caption.gap, unit: ' mm',
       onInput: (v) => update((s) => { s.caption.gap = v; }),
@@ -542,7 +559,7 @@ export function buildPanel({ store, actions }) {
   renderCaptionLines();
 
   // ------------------------------------------------------- style & export
-  const exportSection = section('Preview & export', { open: true });
+  const exportSection = section('Preview & export', { open: true, id: 'section-export' });
   const statsNode = el('p', { class: 'stats' });
   const fileInput = el('input', {
     type: 'file', accept: 'application/json,.json', hidden: true,
@@ -602,6 +619,12 @@ export function buildPanel({ store, actions }) {
     renderResults,
     renderCaptionLines,
     setStats(text) { statsNode.textContent = text; },
+    setCaptionHeight(mm) {
+      captionHeightNote.textContent = st().caption.enabled
+        ? `The caption reserves ${mm.toFixed(1)} mm at the bottom. Shrink it to give the map more room.`
+        : '';
+    },
+    setPinWarning(show) { pinWarning.hidden = !show; },
     setPlacingPin(active) {
       placeButton.classList.toggle('is-active', active);
       placeButton.querySelector('span:last-child').textContent = active

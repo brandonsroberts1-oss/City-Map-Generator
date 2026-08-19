@@ -319,6 +319,163 @@ group('render pipeline (demo fixture)');
   check('per-layer export uses several colours', colours.size >= 5, `${colours.size} distinct`);
 }
 
+// ----------------------------------------------------- clipping artefacts
+group('degenerate bridges');
+{
+  // Taken verbatim from the water layer, where it drew a 38 mm hairline across
+  // empty slate: vertices 4-6 run out to a far apex and straight back.
+  const bridged = [
+    [7.1, 38.74], [7.1, 36.78], [8.05, 36.52], [9.9, 36.31], [10.91, 36.32],
+    [47.57, 46.96], [47.57, 46.96], [25.75, 40.63], [25.13, 40.71], [23.26, 40.82],
+    [21.38, 40.8], [19.47, 40.65], [13.7, 39.85], [11.78, 39.67], [11.68, 39.67],
+  ];
+  const cleaned = clip.removeCollinear(bridged);
+  check('the bridge apex is removed', !cleaned.some((p) => Math.abs(p[0] - 47.57) < 0.01));
+  check('the duplicate apex goes with it', cleaned.length <= bridged.length - 3);
+  check('removing it barely changes the area',
+    Math.abs(Math.abs(clip.signedArea(cleaned)) - Math.abs(clip.signedArea(bridged))) < 0.1);
+
+  check('a redundant midpoint is dropped',
+    clip.removeCollinear([[0, 0], [5, 0], [10, 0], [10, 10], [0, 10]]).length === 4);
+  check('a plain square is left alone',
+    clip.removeCollinear([[0, 0], [10, 0], [10, 10], [0, 10]]).length === 4);
+  check('a 1 mm peninsula survives',
+    clip.removeCollinear([[0, 0], [10, 0], [10, 5], [30, 5.5], [10, 6], [10, 10], [0, 10]]).length === 7);
+  check('a lake island keeps its shape',
+    clip.removeCollinear(clip.ellipsePolygon(0, 0, 4, 3, 24)).length === 24);
+
+  // A concave subject whose visible part is two disconnected prongs is exactly
+  // the case that makes Sutherland-Hodgman emit a bridge.
+  const u = [[0, 0], [10, 0], [10, 10], [7, 10], [7, 3], [3, 3], [3, 10], [0, 10]];
+  const band = clip.convexClipEdges([[-5, 6], [15, 6], [15, 15], [-5, 15]]);
+  const clipped = clip.clipPolygon(u, band);
+  const spurs = clipped.filter((p, i) => {
+    const prev = clipped[(i - 1 + clipped.length) % clipped.length];
+    const next = clipped[(i + 1) % clipped.length];
+    const ax = next[0] - prev[0];
+    const ay = next[1] - prev[1];
+    const span = Math.hypot(ax, ay);
+    if (span < 1e-9) return false;
+    return Math.abs(ax * (p[1] - prev[1]) - ay * (p[0] - prev[0])) / span < 0.01;
+  });
+  check('clipping a concave shape leaves no bridge apex', spurs.length === 0);
+  check('the two prongs still enclose the right area',
+    Math.abs(Math.abs(clip.signedArea(clipped)) - 24) < 0.01, `${Math.abs(clip.signedArea(clipped))}`);
+}
+
+group('clipping artefacts');
+{
+  // A polygon reaching well past the frame used to survive as a hairline
+  // strip along the edge, which reads as a stray line on the coaster.
+  const state = stateMod.createDefaultState();
+  state.border.scope = 'coaster';
+  state.layers.landuseGreen.enabled = true;
+  const raw = JSON.parse(fs.readFileSync('assets/demo/sample-city.json', 'utf8'));
+  const { features } = osm.parseOverpass(raw);
+
+  const thicknessOf = (ring) => {
+    let area = 0;
+    let perimeter = 0;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      area += (ring[j][0] - ring[i][0]) * (ring[j][1] + ring[i][1]);
+      perimeter += Math.hypot(ring[i][0] - ring[j][0], ring[i][1] - ring[j][1]);
+    }
+    return perimeter > 0 ? Math.abs(area / 2) / (perimeter / 2) : 0;
+  };
+
+  let hairlines = 0;
+  let edgeStrokes = 0;
+  let bridges = 0;
+  for (const span of [900, 1200, 2500, 6000, 12000]) {
+    state.view.spanMetres = span;
+    const layout = layoutMod.computeLayout(state);
+    const projection = geo.createProjection({
+      lat: state.location.lat, lon: state.location.lon, spanMetres: span, rect: layout.projectionRect,
+    });
+    const prepared = prepareMod.prepareFeatures(features, { projection, clip: layout.clip, state });
+    const pin = renderMod.computePin(state, layout, projection);
+    prepareMod.applyKnockouts(
+      prepared.byLayer,
+      knockoutMod.buildKnockouts({ state, pin, labels: [], worldBounds: layout.clip.bounds })
+    );
+
+    const b = layout.clip.bounds;
+    for (const bucket of prepared.byLayer.values()) {
+      for (const raw of bucket.areas.flatMap((a) => [...a.outers, ...a.holes])) {
+        if (thicknessOf(raw) < prepareMod.MIN_FILL_THICKNESS_MM) hairlines++;
+        // A bridge apex is emitted twice; leaving the duplicate in place makes
+        // every vertex look like it has a zero-distance neighbour.
+        const ring = raw.filter((p, i) => {
+          const q = raw[(i - 1 + raw.length) % raw.length];
+          return Math.hypot(p[0] - q[0], p[1] - q[1]) > 1e-9;
+        });
+        for (let i = 0; i < ring.length; i++) {
+          const prev = ring[(i - 1 + ring.length) % ring.length];
+          const next = ring[(i + 1) % ring.length];
+          const ax = next[0] - prev[0];
+          const ay = next[1] - prev[1];
+          const span = Math.hypot(ax, ay);
+          if (span < 1e-9) continue;
+          const off = Math.abs(ax * (ring[i][1] - prev[1]) - ay * (ring[i][0] - prev[0])) / span;
+          // Dead on the neighbours' line but millimetres away from both of
+          // them is the shape of a bridge apex, never of real coastline: a
+          // gently curved edge that far out deviates by twenty times as much.
+          const reach = Math.min(
+            Math.hypot(ring[i][0] - prev[0], ring[i][1] - prev[1]),
+            Math.hypot(ring[i][0] - next[0], ring[i][1] - next[1])
+          );
+          if (off < 0.004 && reach > 3) bridges++;
+        }
+      }
+      // A stroked outline must never trace the frame itself.
+      for (const line of bucket.outlines) {
+        for (let i = 1; i < line.length; i++) {
+          const [x0, y0] = line[i - 1];
+          const [x1, y1] = line[i];
+          if (Math.hypot(x1 - x0, y1 - y0) < 4) continue;
+          const onEdge =
+            (Math.abs(y0 - b.maxY) < 0.12 && Math.abs(y1 - b.maxY) < 0.12) ||
+            (Math.abs(y0 - b.minY) < 0.12 && Math.abs(y1 - b.minY) < 0.12) ||
+            (Math.abs(x0 - b.minX) < 0.12 && Math.abs(x1 - b.minX) < 0.12) ||
+            (Math.abs(x0 - b.maxX) < 0.12 && Math.abs(x1 - b.maxX) < 0.12);
+          if (onEdge) edgeStrokes++;
+        }
+      }
+    }
+  }
+  check('clipping leaves no hairline fills', hairlines === 0, `${hairlines} found`);
+  check('clipping leaves no degenerate bridges', bridges === 0, `${bridges} found`);
+  check('outlined areas never trace the map frame', edgeStrokes === 0, `${edgeStrokes} found`);
+
+  // The filter must not eat legitimately thin things.
+  const narrowButReal = [[0, 0], [40, 0], [40, 0.5], [0, 0.5]];
+  check('a 0.5 mm band is thicker than the artefact threshold',
+    thicknessOf(narrowButReal) > prepareMod.MIN_FILL_THICKNESS_MM);
+  const hairline = [[0, 0], [40, 0], [40, 0.02], [0, 0.02]];
+  check('a 0.02 mm strip is below it', thicknessOf(hairline) < prepareMod.MIN_FILL_THICKNESS_MM);
+}
+
+// -------------------------------------------------------------- caption size
+group('caption size');
+{
+  const base = stateMod.createDefaultState();
+  const full = layoutMod.computeLayout(base);
+  const small = stateMod.createDefaultState();
+  small.caption.scale = 0.5;
+  const shrunk = layoutMod.computeLayout(small);
+  check('halving the caption scale halves its height',
+    near(shrunk.caption.height, full.caption.height / 2, 1e-6));
+  check('a smaller caption gives the map more room', shrunk.mapBox.h > full.mapBox.h);
+  check('the extra room equals what the caption gave up',
+    near(shrunk.mapBox.h - full.mapBox.h, full.caption.height - shrunk.caption.height, 1e-6));
+  check('scaled lines carry their scaled size', near(shrunk.caption.lines[0].size, full.caption.lines[0].size / 2, 1e-9));
+  check('letter spacing scales with the text',
+    near(shrunk.caption.lines[1].tracking, full.caption.lines[1].tracking / 2, 1e-9));
+  const big = stateMod.createDefaultState();
+  big.caption.scale = 1.8;
+  check('a larger caption takes room from the map', layoutMod.computeLayout(big).mapBox.h < full.mapBox.h);
+}
+
 // ---------------------------------------------------------------- pin shapes
 group('pin shapes');
 {
@@ -383,6 +540,26 @@ group('pin shapes');
   check('heart anchors its text above centre', heart.anchorY < 0);
   check('dot is not offered text', !pinshapes.TEXT_STYLES.has('dot'));
   check('oval is offered text', pinshapes.TEXT_STYLES.has('oval'));
+
+  // A pin whose coordinates are off the current view has to say so, or the
+  // "show pin" toggle looks like it does nothing.
+  const state = stateMod.createDefaultState();
+  const layout = layoutMod.computeLayout(state);
+  const projection = geo.createProjection({
+    lat: state.location.lat, lon: state.location.lon,
+    spanMetres: state.view.spanMetres, rect: layout.projectionRect,
+  });
+  check('a centred pin reports itself on the map',
+    renderMod.computePin(state, layout, projection).onMap === true);
+  const strayed = stateMod.createDefaultState();
+  strayed.pin.followCentre = false;
+  strayed.pin.lat = 51.5074;
+  strayed.pin.lon = -0.1278;
+  check('a pin left in another city reports itself off the map',
+    renderMod.computePin(strayed, layout, projection).onMap === false);
+  const off = stateMod.createDefaultState();
+  off.pin.enabled = false;
+  check('no pin at all when it is switched off', renderMod.computePin(off, layout, projection) === null);
 }
 
 // ----------------------------------------------------------- caption offsets
@@ -529,6 +706,74 @@ if (!process.argv.includes('--no-browser')) {
     const after = await page.evaluate(() => JSON.parse(localStorage.getItem('city-map-coaster:design:v1')));
     check('dragging pans the map', after.location.lat !== before.location.lat);
     check('the design persists to localStorage', Boolean(after.coaster));
+
+    // --- the caption size slider is the quick way to reclaim map space
+    const mapHeight = () =>
+      page.evaluate(() => {
+        const d = document.querySelector('#layer-residential path').getAttribute('d');
+        const ys = [...d.matchAll(/-?\d+(?:\.\d+)?/g)].map(Number).filter((_, i) => i % 2 === 1);
+        return Math.max(...ys) - Math.min(...ys);
+      });
+    const captionText = () => page.locator('#caption-height-note').textContent();
+    const beforeShrink = await mapHeight();
+    const captionSlider = page.locator('#caption-scale input[type=range]');
+    await captionSlider.fill('0.5');
+    await page.waitForTimeout(500);
+    check('shrinking the caption gives the map more height', (await mapHeight()) > beforeShrink);
+    check('the panel reports the reserved caption height', /reserves \d/.test(await captionText()));
+    await captionSlider.fill('1');
+    await page.waitForTimeout(400);
+
+    // --- a pin stranded in another city must not silently vanish
+    await page.evaluate(() => {
+      const key = 'city-map-coaster:design:v1';
+      const design = JSON.parse(localStorage.getItem(key));
+      design.pin.enabled = true;
+      design.pin.followCentre = false;
+      design.pin.lat = 51.5074;
+      design.pin.lon = -0.1278;
+      localStorage.setItem(key, JSON.stringify(design));
+    });
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#preview svg');
+    await page.getByRole('button', { name: 'Use demo city' }).click();
+    await page.waitForFunction(() => /demo data/.test(document.querySelector('.stats')?.textContent || ''));
+    await page.evaluate(() => document.querySelectorAll('details.section').forEach((d) => (d.open = true)));
+    await page.waitForTimeout(400);
+    check('loading a city rescues a stranded pin', (await page.locator('.notice').isVisible()) === false);
+
+    await page.evaluate(() => {
+      const key = 'city-map-coaster:design:v1';
+      const design = JSON.parse(localStorage.getItem(key));
+      design.pin.followCentre = false;
+      design.pin.lat = 51.5074;
+      design.pin.lon = -0.1278;
+      localStorage.setItem(key, JSON.stringify(design));
+    });
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#preview svg');
+    await page.evaluate(() => document.querySelectorAll('details.section').forEach((d) => (d.open = true)));
+    await page.waitForTimeout(400);
+    check('an off-map pin is called out', await page.locator('.notice').isVisible());
+
+    // Toggling the pin off and on has to put something on screen.
+    await page.getByText('Show a pin', { exact: true }).click();
+    await page.waitForTimeout(300);
+    await page.getByText('Show a pin', { exact: true }).click();
+    await page.waitForTimeout(500);
+    const pinInView = await page.evaluate(() => {
+      const pin = document.querySelector('#pin path');
+      if (!pin) return null;
+      const svg = document.querySelector('#preview svg').getBoundingClientRect();
+      const box = pin.getBoundingClientRect();
+      return box.width > 0 && box.left >= svg.left - 1 && box.right <= svg.right + 1 &&
+        box.top >= svg.top - 1 && box.bottom <= svg.bottom + 1;
+    });
+    check('switching the pin on always shows it', pinInView === true);
+    check('the off-map notice clears once it is back', (await page.locator('.notice').isVisible()) === false);
+    await page.getByRole('button', { name: 'Use demo city' }).click();
+    await page.waitForFunction(() => /demo data/.test(document.querySelector('.stats')?.textContent || ''));
+    await page.waitForTimeout(300);
 
     // --- border around the whole face, caption included
     await page.getByRole('button', { name: 'Map + caption', exact: true }).click();

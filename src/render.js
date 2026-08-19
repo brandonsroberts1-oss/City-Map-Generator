@@ -104,23 +104,22 @@ export function computePin(state, layout, projection) {
     grow: cfg.clearSpace ? Math.max(0, cfg.clearance) : 0,
   });
 
-  return {
-    x,
-    y,
-    headY,
-    lat,
-    lon,
-    text,
-    metrics,
-    font,
-    shape,
-    box: {
-      minX: shape.box.minX - 0.6,
-      maxX: shape.box.maxX + 0.6,
-      minY: shape.box.minY - 0.6,
-      maxY: shape.box.maxY + 0.6,
-    },
+  const box = {
+    minX: shape.box.minX - 0.6,
+    maxX: shape.box.maxX + 0.6,
+    minY: shape.box.minY - 0.6,
+    maxY: shape.box.maxY + 0.6,
   };
+
+  // A pin whose coordinates are miles from the current view still "exists", it
+  // is just drawn somewhere nobody can see. Saying so lets the UI offer a way
+  // back instead of leaving the toggle looking broken.
+  const view = layout.clip.bounds;
+  const onMap = !(
+    box.maxX < view.minX || box.minX > view.maxX || box.maxY < view.minY || box.minY > view.maxY
+  );
+
+  return { x, y, headY, lat, lon, text, metrics, font, shape, box, onMap };
 }
 
 function pinMarkup(state, pin, ink) {

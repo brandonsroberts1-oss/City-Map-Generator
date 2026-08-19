@@ -113,6 +113,7 @@ export function createDefaultState() {
     caption: {
       enabled: true,
       autoFill: true,
+      scale: 1,
       gap: 3,
       offsetX: 0,
       offsetY: 0,

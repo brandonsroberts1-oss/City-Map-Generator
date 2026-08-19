@@ -40,20 +40,29 @@ function halfPlaneAbove(y, rectBounds) {
   };
 }
 
-/** Height and per-line baselines for the caption block. */
+/**
+ * Height and per-line baselines for the caption block.
+ *
+ * `caption.scale` multiplies every line at once, which is the quick way to give
+ * the map more room: the block's height is what the map window is measured
+ * against, so shrinking the text grows the map.
+ */
 export function measureCaption(caption) {
+  const scale = caption.scale ?? 1;
   const lines = [];
   let total = 0;
   for (const line of caption.lines) {
+    const size = line.size * scale;
     if (!line.text || !line.text.trim()) {
-      if (line.blankKeepsSpace !== false) total += line.size * line.lineHeight;
+      total += size * line.lineHeight;
       continue;
     }
     const font = getLoadedFont(line.font, line.weight, line.italic);
     const text = applyTextCase(line.text, line.textCase);
-    const metrics = measureText(font, text, line.size, line.tracking);
-    const advance = line.size * line.lineHeight;
-    lines.push({ ...line, text, metrics, advance, offsetY: total });
+    const tracking = line.tracking * scale;
+    const metrics = measureText(font, text, size, tracking);
+    const advance = size * line.lineHeight;
+    lines.push({ ...line, size, tracking, text, metrics, advance, offsetY: total });
     total += advance;
   }
   return { lines, height: total };

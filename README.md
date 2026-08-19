@@ -44,17 +44,21 @@ optional cut line on its own layer.
 
 **Caption.** Any number of lines under the map, each with its own font, weight,
 italic, size, letter-spacing, line-spacing, capitalisation, alignment and
-sideways nudge. Drag the caption in the preview to move the whole block, or nudge
-it with the sliders. Searching a place rewrites the place name and coordinates
-for you, and panning keeps the coordinates in step until you edit the text
-yourself.
+sideways nudge. One **overall caption size** slider scales the whole block at
+once, and the panel reports how many millimetres it is reserving — shrink it and
+the map grows into the space. Drag the caption in the preview to move it, or
+nudge it with the sliders. Searching a place rewrites the place name and
+coordinates for you, and panning keeps the coordinates in step until you edit the
+text yourself.
 
 **Pin.** Seven marker shapes — disc, oval, pill, heart, teardrop map pin, ring
 and plain dot — centred on the map or dropped anywhere by clicking. Put `Home`,
 `Family` or anything else inside, knocked out of the shape so the letters stay
 unengraved. The oval and pill stretch to fit the word; the round shapes grow as a
 whole, so "Pin size" is a floor rather than a hard limit and a long word never
-spills over the edge.
+spills over the edge. Switching the pin on always puts it somewhere visible: if
+its saved coordinates are outside the current view, it is moved to the middle
+rather than drawn off the coaster.
 
 **Undo.** Undo and redo sit at the top of the panel and answer to Ctrl/Cmd+Z and
 Ctrl/Cmd+Shift+Z. History works in gestures, so dragging a slider is one step
@@ -81,6 +85,11 @@ happens to look right":
 - **Genuine clear space.** The pin and each label do not merely sit *on top of*
   the streets — the streets underneath are actually removed, so knocked-out
   letters read as bare slate instead of filling in with whatever ran beneath.
+- **No phantom lines.** Clipping a lake or a wood at the edge of the map can
+  leave geometry that is not really there: a hairline strip a few hundredths of
+  a millimetre thick, or a degenerate "bridge" streaking across the map when the
+  visible part of a concave shape falls into two pieces. Both are removed before
+  anything is drawn, so the file contains only features the map actually has.
 - **Named layers.** Each layer is its own `<g>` with an id and an Inkscape layer
   label, which LightBurn and Inkscape both pick up.
 - **Optional colour coding.** "Colour per layer" gives every layer a distinct
@@ -132,11 +141,13 @@ npm test -- --no-browser
 The suite checks the projection round-trips, that clipping and knockout
 subtraction remove exactly the right area, that multipolygon lakes keep their
 islands, that no geometry escapes the map window, that nothing survives under the
-pin, and that every marker shape's knockout really covers the shape drawn on top
-of it. The browser pass boots the app, cycles through all seven marker shapes,
-drags the caption, undoes and redoes, resets, searches a stubbed place and checks
-the caption filled itself, then exports an SVG and confirms it restores after a
-reload.
+pin, that every marker shape's knockout really covers the shape drawn on top of
+it, and — sweeping the demo city at five zoom levels — that clipping leaves
+behind neither hairline fills nor degenerate bridges. The browser pass boots the app, cycles through all seven marker shapes,
+drags the caption, undoes and redoes, resets, shrinks the caption and checks the
+map grows, strands the pin in another city and checks switching it on brings it
+back, searches a stubbed place and checks the caption filled itself, then exports
+an SVG and confirms it restores after a reload.
 
 `node tools/render-fixture.mjs out.svg --preset labels` renders the demo city
 headlessly, which is handy when changing the geometry pipeline.
@@ -146,7 +157,7 @@ headlessly, which is handy when changing the geometry pipeline.
 | File | Job |
 | --- | --- |
 | `src/geo.js` | Web-Mercator projection, lon/lat ↔ millimetres |
-| `src/clip.js` | Convex clipping, and the subtraction that makes clear space |
+| `src/clip.js` | Convex clipping, artefact cleanup, and the subtraction that makes clear space |
 | `src/simplify.js` | Douglas–Peucker thinning in millimetre space |
 | `src/overpass.js` | Query assembly and mirror fallback |
 | `src/geocode.js` | Nominatim with a Photon fallback |

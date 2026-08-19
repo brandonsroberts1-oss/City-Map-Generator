@@ -95,6 +95,67 @@ function distanceTo(edge, p) {
 }
 
 /**
+ * Drops vertices that sit on the straight line through their neighbours.
+ *
+ * This is not just tidying. When Sutherland-Hodgman clips a concave polygon
+ * whose visible part is in two or more disconnected pieces, it cannot return
+ * several polygons — so it returns one, joining the pieces with a degenerate
+ * bridge that runs out to a point and straight back. The bridge encloses almost
+ * no area, but "almost" is not "none", and it fills as a hairline streaking
+ * across the map from nowhere to nowhere. Its apex is exactly a vertex lying on
+ * the line through its neighbours, so removing those removes the bridge.
+ *
+ * The tolerance is in millimetres and far below what any laser resolves, so
+ * nothing real is lost.
+ */
+export function removeCollinear(ring, tolerance = 0.01) {
+  let points = ring;
+  // Coincident points make the collinearity test meaningless, so go first.
+  const deduped = [];
+  for (const point of points) {
+    const last = deduped[deduped.length - 1];
+    if (!last || Math.abs(last[0] - point[0]) > 1e-9 || Math.abs(last[1] - point[1]) > 1e-9) {
+      deduped.push(point);
+    }
+  }
+  while (deduped.length > 1) {
+    const first = deduped[0];
+    const last = deduped[deduped.length - 1];
+    if (Math.abs(first[0] - last[0]) > 1e-9 || Math.abs(first[1] - last[1]) > 1e-9) break;
+    deduped.pop();
+  }
+  points = deduped;
+
+  let changed = true;
+  while (changed && points.length > 3) {
+    changed = false;
+    const kept = [];
+    for (let i = 0; i < points.length; i++) {
+      const prev = kept.length ? kept[kept.length - 1] : points[(i - 1 + points.length) % points.length];
+      const next = points[(i + 1) % points.length];
+      const ax = next[0] - prev[0];
+      const ay = next[1] - prev[1];
+      const span = Math.hypot(ax, ay);
+      if (span < 1e-9) {
+        kept.push(points[i]);
+        continue;
+      }
+      // Perpendicular distance to the infinite line, not the segment: a bridge
+      // apex sits far beyond its neighbours but still dead on their line.
+      const cross = ax * (points[i][1] - prev[1]) - ay * (points[i][0] - prev[0]);
+      if (Math.abs(cross) / span < tolerance) {
+        changed = true;
+        continue;
+      }
+      kept.push(points[i]);
+    }
+    if (kept.length < 3) return [];
+    points = kept;
+  }
+  return points.length >= 3 ? points : [];
+}
+
+/**
  * Sutherland-Hodgman polygon clipping. Returns [] when nothing survives.
  * Only valid for convex clip regions, which is all we ever use.
  */
@@ -122,7 +183,7 @@ export function clipPolygon(ring, clip) {
       prevD = curD;
     }
   }
-  return output.length >= 3 ? output : [];
+  return output.length >= 3 ? removeCollinear(output) : [];
 }
 
 /**

@@ -22,6 +22,29 @@ function polylineLength(points) {
   return total;
 }
 
+/**
+ * Mean thickness of a ring: twice its area over its perimeter.
+ *
+ * Clipping a large polygon at the map edge can leave a piece that is tens of
+ * millimetres long and a few hundredths thick. Filled, that reads as a stray
+ * hairline running along the frame — and it is finer than any laser can
+ * resolve, so there is nothing to lose by dropping it.
+ */
+function ringThickness(ring) {
+  let area = 0;
+  let perimeter = 0;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    area += (ring[j][0] - ring[i][0]) * (ring[j][1] + ring[i][1]);
+    perimeter += Math.hypot(ring[i][0] - ring[j][0], ring[i][1] - ring[j][1]);
+  }
+  return perimeter > 0 ? Math.abs(area) / perimeter : 0;
+}
+
+/** Below this, a filled shape is a clipping artefact rather than a feature. */
+export const MIN_FILL_THICKNESS_MM = 0.08;
+
+const isHairline = (ring) => ringThickness(ring) < MIN_FILL_THICKNESS_MM;
+
 function centroidOfRing(ring) {
   let area = 0;
   let cx = 0;
@@ -117,42 +140,68 @@ export function prepareFeatures(features, { projection, clip, state }) {
       layer.minAreaMm2 || 0,
       feature.layerId === 'buildings' ? state.detail.minBuildingMm2 : 0
     );
+    const filled = settings.mode === 'fill';
     const outers = [];
     const holes = [];
+    const outlinePieces = [];
     let totalArea = 0;
     let biggest = null;
+    const needsAnchor = wantLabels && Boolean(feature.name);
 
     for (const ring of feature.rings) {
       const projected = ring.map(project);
       if (boundsDisjoint(boundsOf(projected), clipBounds)) continue;
       const thinned = simplifyRing(projected, tolerance);
-      const clipped = clipPolygon(thinned, clip);
-      if (clipped.length < 3) continue;
-      const area = Math.abs(signedArea(clipped));
-      if (area < minArea) continue;
-      totalArea += area;
-      if (!biggest || area > biggest.area) biggest = { area, ring: clipped };
-      outers.push(orient(clipped, true));
-    }
-    if (!outers.length) continue;
 
-    for (const ring of feature.holes || []) {
-      const projected = ring.map(project);
-      if (boundsDisjoint(boundsOf(projected), clipBounds)) continue;
-      const clipped = clipPolygon(simplifyRing(projected, tolerance), clip);
-      if (clipped.length < 3) continue;
-      if (Math.abs(signedArea(clipped)) < minArea) continue;
-      holes.push(orient(clipped, false));
+      if (filled) {
+        const clipped = clipPolygon(thinned, clip);
+        if (clipped.length < 3) continue;
+        const area = Math.abs(signedArea(clipped));
+        if (area < minArea || isHairline(clipped)) continue;
+        totalArea += area;
+        if (!biggest || area > biggest.area) biggest = { area, ring: clipped };
+        outers.push(orient(clipped, true));
+        continue;
+      }
+
+      // Outline mode: clipping the ring as a *polygon* would close it along the
+      // map's edge and stroke that edge, drawing a line the map does not have.
+      // Clipped as an open path it simply stops at the frame.
+      if (Math.abs(signedArea(thinned)) < minArea) continue;
+      const pieces = clipPolyline([...thinned, thinned[0]], clip);
+      if (!pieces.length) continue;
+      outlinePieces.push(...pieces);
+      if (needsAnchor) {
+        const clipped = clipPolygon(thinned, clip);
+        if (clipped.length >= 3) {
+          const area = Math.abs(signedArea(clipped));
+          totalArea += area;
+          if (!biggest || area > biggest.area) biggest = { area, ring: clipped };
+        }
+      }
     }
 
-    // Outline-mode areas travel as closed polylines, not rings: once a label or
-    // the pin punches a hole in them, a ring would have to re-close across the
-    // gap and draw a chord straight through the middle of the park.
-    if (settings.mode === 'fill') {
+    if (filled) {
+      if (!outers.length) continue;
+      for (const ring of feature.holes || []) {
+        const projected = ring.map(project);
+        if (boundsDisjoint(boundsOf(projected), clipBounds)) continue;
+        const clipped = clipPolygon(simplifyRing(projected, tolerance), clip);
+        if (clipped.length < 3) continue;
+        if (Math.abs(signedArea(clipped)) < minArea || isHairline(clipped)) continue;
+        holes.push(orient(clipped, false));
+      }
       bucket(feature.layerId).areas.push({ outers, holes });
     } else {
-      const target = bucket(feature.layerId).outlines;
-      for (const ring of [...outers, ...holes]) target.push([...ring, ring[0]]);
+      for (const ring of feature.holes || []) {
+        const projected = ring.map(project);
+        if (boundsDisjoint(boundsOf(projected), clipBounds)) continue;
+        const thinned = simplifyRing(projected, tolerance);
+        if (Math.abs(signedArea(thinned)) < minArea) continue;
+        outlinePieces.push(...clipPolyline([...thinned, thinned[0]], clip));
+      }
+      if (!outlinePieces.length) continue;
+      bucket(feature.layerId).outlines.push(...outlinePieces);
     }
 
     if (wantLabels && feature.name && biggest) {
@@ -201,12 +250,16 @@ export function applyKnockouts(byLayer, knockouts) {
       for (const area of bucket.areas) {
         const outers = [];
         for (const ring of area.outers) {
-          for (const piece of subtractFromRing(ring, knockouts)) outers.push(orient(piece, true));
+          for (const piece of subtractFromRing(ring, knockouts)) {
+            if (!isHairline(piece)) outers.push(orient(piece, true));
+          }
         }
         if (!outers.length) continue;
         const holes = [];
         for (const ring of area.holes) {
-          for (const piece of subtractFromRing(ring, knockouts)) holes.push(orient(piece, false));
+          for (const piece of subtractFromRing(ring, knockouts)) {
+            if (!isHairline(piece)) holes.push(orient(piece, false));
+          }
         }
         areas.push({ outers, holes });
       }

@@ -46,6 +46,12 @@ const presets = {
     s.layers.water.mode = 'outline';
     s.pin.style = 'teardrop';
   },
+  artifact: (s) => {
+    s.border.scope = 'coaster';
+    s.layers.landuseGreen.enabled = true;
+    s.view.spanMetres = 6000;
+    s.labels.enabled = false;
+  },
   noborder: (s) => {
     s.border.enabled = false;
     s.coaster.margin = 0;
