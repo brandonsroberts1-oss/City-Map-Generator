@@ -72,6 +72,14 @@ they name, with collision avoidance and a cap on how many appear.
 The exported file is built for laser software specifically, not just "an SVG that
 happens to look right":
 
+- **Filled shapes, not strokes.** This is the one that bites hardest. xTool
+  Creative Space imports an SVG as paths and throws `stroke-width` away, so a
+  0.6 mm road arrives as a hairline and a stroked frame arrives as nothing worth
+  engraving. Every line here is therefore expanded into a closed shape of the
+  right width before export — the file contains no `stroke`, no `stroke-width`
+  and no `fill="none"` at all, so there is nothing left for an importer to
+  discard. (**Line geometry → Centre lines** turns this off for LightBurn line
+  mode, which does honour stroke widths and makes a smaller file.)
 - **Real millimetres.** The root element carries `width="100mm" height="100mm"`
   alongside a matching `viewBox`, so the artwork imports at 1:1 with no scaling
   step to get wrong.
@@ -100,14 +108,22 @@ happens to look right":
 
 1. Add → Import Image/File, pick the SVG. It arrives at its true size; do not
    scale it.
-2. Set the processing type to **Engrave** (fill/raster) for the map. Slate takes
-   a light touch — start around 60–70% power at high speed and test on an
-   offcut.
-3. If you exported with **Colour per layer**, XCS splits the file into one object
+2. Select it and set the processing type to **Engrave** (fill), not Score or
+   Cut. XCS defaults imported vectors to outline processing, which draws every
+   shape as a hairline outline — including the frame and the caption letters.
+   Engrave fills them, which is what makes the line weights you chose appear.
+3. Slate takes a light touch — start around 60–70% power at high speed and test
+   on an offcut.
+4. If you exported with **Colour per layer**, XCS splits the file into one object
    per colour; select each and set its own parameters. Solid buildings and water
-   usually want more power than hairline streets.
-4. If you enabled the cut line, move that layer to **Cut** (or **Score**) — it is
-   the only red `#ff0000` path in the file.
+   usually want more power than fine streets.
+5. If you enabled the cut line, move that layer to **Cut** (or **Score**) — it is
+   the only red `#ff0000` path in the file, and the only one exported as a
+   centre line, because a cut follows a path rather than filling a shape.
+
+If the artwork still comes in as hairline outlines, the object is set to Score or
+Cut rather than Engrave — step 2. Nothing in the file depends on stroke widths,
+so there is no export setting that can cause it.
 
 ### Importing into LightBurn
 
@@ -142,8 +158,11 @@ The suite checks the projection round-trips, that clipping and knockout
 subtraction remove exactly the right area, that multipolygon lakes keep their
 islands, that no geometry escapes the map window, that nothing survives under the
 pin, that every marker shape's knockout really covers the shape drawn on top of
-it, and — sweeping the demo city at five zoom levels — that clipping leaves
-behind neither hairline fills nor degenerate bridges. The browser pass boots the app, cycles through all seven marker shapes,
+it, that stroke expansion reproduces the widths it replaces, and — sweeping the
+demo city at five zoom levels — that clipping leaves behind neither hairline
+fills nor degenerate bridges. The export is checked to contain no stroke
+attributes whatsoever, and the two geometry modes are rendered in a real browser
+and compared pixel by pixel. The browser pass boots the app, cycles through all seven marker shapes,
 drags the caption, undoes and redoes, resets, shrinks the caption and checks the
 map grows, strands the pin in another city and checks switching it on brings it
 back, searches a stubbed place and checks the caption filled itself, then exports
@@ -158,6 +177,7 @@ headlessly, which is handy when changing the geometry pipeline.
 | --- | --- |
 | `src/geo.js` | Web-Mercator projection, lon/lat ↔ millimetres |
 | `src/clip.js` | Convex clipping, artefact cleanup, and the subtraction that makes clear space |
+| `src/stroke.js` | Expands centre lines into closed filled outlines |
 | `src/simplify.js` | Douglas–Peucker thinning in millimetre space |
 | `src/overpass.js` | Query assembly and mirror fallback |
 | `src/geocode.js` | Nominatim with a Photon fallback |

@@ -4,7 +4,7 @@
 
 import { roundedRectPolygon, ellipsePolygon, convexClipEdges } from './clip.js';
 import { measureText, getLoadedFont, applyTextCase } from './typography.js';
-import { roundedRectPath, ellipsePath } from './paths.js';
+import { roundedRectPath, ellipsePath, roundedRectBandPath, ellipseBandPath } from './paths.js';
 
 function deflate(rect, amount) {
   return {
@@ -216,14 +216,22 @@ export function computeLayout(state) {
     clipPathD = roundedRectPath(clipRect, clipRadius);
   }
 
+  // The frame is offered two ways: as a centre line, and as a filled ring.
+  // Laser software that ignores stroke-width turns the first into a hairline,
+  // so the ring is what actually gets exported by default.
   let borderPath = null;
+  let borderBandPath = null;
   if (border.enabled) {
     const circleBorderR = Math.max(1, contentRadius - border.thickness / 2);
-    borderPath = isCircle
-      ? ellipsePath(centreX, centreY, circleBorderR, circleBorderR)
-      : borderOnMap
-        ? roundedRectPath(mapFrameRect, mapFrameRadius)
-        : roundedRectPath(frame, frameRadius);
+    if (isCircle) {
+      borderPath = ellipsePath(centreX, centreY, circleBorderR, circleBorderR);
+      borderBandPath = ellipseBandPath(centreX, centreY, circleBorderR, border.thickness);
+    } else {
+      const rect = borderOnMap ? mapFrameRect : frame;
+      const radius = borderOnMap ? mapFrameRadius : frameRadius;
+      borderPath = roundedRectPath(rect, radius);
+      borderBandPath = roundedRectBandPath(rect, radius, border.thickness);
+    }
   }
 
   const cutPath = coaster.cutLine
@@ -250,6 +258,7 @@ export function computeLayout(state) {
     clip,
     clipPathD,
     borderPath,
+    borderBandPath,
     borderWidth: border.thickness,
     caption: buildCaptionBlock(captionMetrics, {
       top: captionTop + caption.offsetY,

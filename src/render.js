@@ -4,6 +4,8 @@
 
 import { LAYERS, LINE } from './layers.js';
 import { buildPinShape, pinHeadOffset, TEXT_STYLES, minRadiusForText } from './pinshapes.js';
+import { strokeOutlines } from './stroke.js';
+import { ellipseBandPath } from './paths.js';
 import { getLoadedFont, textCommands, commandsToPathData, rotationMatrix, applyTextCase, measureText } from './typography.js';
 
 export const PREVIEW_THEMES = {
@@ -122,7 +124,7 @@ export function computePin(state, layout, projection) {
   return { x, y, headY, lat, lon, text, metrics, font, shape, box, onMap };
 }
 
-function pinMarkup(state, pin, ink) {
+function pinMarkup(state, pin, ink, asOutlines) {
   const cfg = state.pin;
   if (!pin) return '';
   const { shape } = pin;
@@ -143,8 +145,11 @@ function pinMarkup(state, pin, ink) {
       : '';
 
   if (cfg.style === 'ring') {
+    const c = shape.circle;
     parts.push(
-      `<path d="${shape.path}" fill="none" stroke="${ink}" stroke-width="${num(cfg.strokeWidth, 3)}"/>`
+      asOutlines && c
+        ? `<path d="${ellipseBandPath(c.cx, c.cy, c.r, cfg.strokeWidth)}" fill="${ink}" fill-rule="nonzero" stroke="none"/>`
+        : `<path d="${shape.path}" fill="none" stroke="${ink}" stroke-width="${num(cfg.strokeWidth, 3)}"/>`
     );
     if (textData) parts.push(`<path d="${textData}" fill="${ink}"/>`);
     return parts.join('');
@@ -224,6 +229,18 @@ export function renderSvg({ state, layout, projection, prepared, labels, pin, mo
   const decimals = 2;
   const scale = state.detail.strokeScale;
   const cap = state.detail.lineCap;
+  // Filled outlines rather than centre lines: see src/stroke.js. The preview
+  // uses whichever the export will, so the two cannot drift apart.
+  const asOutlines = state.style.geometry !== 'strokes';
+
+  /** One layer's worth of centre lines, as either an outlined or stroked path. */
+  const linework = (lines, ink, width) =>
+    asOutlines
+      ? `<path d="${strokeOutlines(lines, width, { cap, decimals: 3 })}" fill="${ink}" fill-rule="nonzero" stroke="none"/>`
+      : `<path d="${linesToPathData(lines, decimals)}" fill="none" stroke="${ink}" stroke-width="${num(
+          width,
+          3
+        )}" stroke-linecap="${cap}" stroke-linejoin="round"/>`;
 
   const groups = [];
   const stats = { paths: 0, segments: 0, layers: 0 };
@@ -244,34 +261,31 @@ export function renderSvg({ state, layout, projection, prepared, labels, pin, mo
     const width = num(Math.max(0.01, settings.weight * scale), 3);
 
     if (layer.kind === LINE) {
-      const d = linesToPathData(bucket.lines, decimals);
-      if (!d) continue;
+      if (!bucket.lines.length) continue;
       stats.paths += 1;
       stats.segments += bucket.lines.length;
       stats.layers += 1;
       mapParts.push(
         `<g id="layer-${layer.id}" data-layer="${layer.id}"${
           isExport ? ` inkscape:groupmode="layer" inkscape:label="${esc(layer.label)}"` : ''
-        }><path d="${d}" fill="none" stroke="${ink}" stroke-width="${width}" stroke-linecap="${cap}" stroke-linejoin="round"/></g>`
+        }>${linework(bucket.lines, ink, width)}</g>`
       );
       continue;
     }
 
     const filled = settings.mode === 'fill';
-    const d = filled
-      ? ringsToPathData(bucket.areas, decimals)
-      : linesToPathData(bucket.outlines, decimals);
-    if (!d) continue;
+    if (filled && !bucket.areas.length) continue;
+    if (!filled && !bucket.outlines.length) continue;
+    const body = filled
+      ? `<path d="${ringsToPathData(bucket.areas, decimals)}" fill="${ink}" fill-rule="nonzero" stroke="none"/>`
+      : linework(bucket.outlines, ink, width);
     stats.paths += 1;
     stats.segments += filled ? bucket.areas.length : bucket.outlines.length;
     stats.layers += 1;
-    const shapeAttrs = filled
-      ? `fill="${ink}" fill-rule="nonzero" stroke="none"`
-      : `fill="none" stroke="${ink}" stroke-width="${width}" stroke-linecap="${cap}" stroke-linejoin="round"`;
     mapParts.push(
       `<g id="layer-${layer.id}" data-layer="${layer.id}"${
         isExport ? ` inkscape:groupmode="layer" inkscape:label="${esc(layer.label)}"` : ''
-      }><path d="${d}" ${shapeAttrs}/></g>`
+      }>${body}</g>`
     );
   }
   if (mapParts.length) groups.push(`<g id="map">${mapParts.join('')}</g>`);
@@ -282,16 +296,19 @@ export function renderSvg({ state, layout, projection, prepared, labels, pin, mo
   }
 
   if (pin) {
-    const markup = pinMarkup(state, pin, inkFor('pin'));
+    const markup = pinMarkup(state, pin, inkFor('pin'), asOutlines);
     if (markup) groups.push(`<g id="pin" data-role="pin">${markup}</g>`);
   }
 
   if (layout.borderPath) {
-    groups.push(
-      `<g id="border" data-role="border"><path d="${layout.borderPath}" fill="none" stroke="${inkFor(
-        'border'
-      )}" stroke-width="${num(layout.borderWidth, 3)}"/></g>`
-    );
+    const borderInk = inkFor('border');
+    const body = asOutlines
+      ? `<path d="${layout.borderBandPath}" fill="${borderInk}" fill-rule="nonzero" stroke="none"/>`
+      : `<path d="${layout.borderPath}" fill="none" stroke="${borderInk}" stroke-width="${num(
+          layout.borderWidth,
+          3
+        )}"/>`;
+    groups.push(`<g id="border" data-role="border">${body}</g>`);
   }
 
   const caption = captionMarkup(layout, inkFor('caption'));

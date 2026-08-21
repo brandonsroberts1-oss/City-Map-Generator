@@ -203,6 +203,8 @@ export function buildPinShape(style, {
       shape.path = circlePath(cx, cy, R, decimals);
       shape.pieces = [circlePolygon(cx, cy, R + g, 48)];
       shape.box = { minX: cx - R, maxX: cx + R, minY: cy - R, maxY: cy + R };
+      // The ring style needs its own filled-band version for laser export.
+      shape.circle = { cx, cy, r: R };
       return shape;
     }
   }

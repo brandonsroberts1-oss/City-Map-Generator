@@ -55,6 +55,8 @@ const knockoutMod = await import('../src/knockouts.js');
 const labelsMod = await import('../src/labels.js');
 const pinshapes = await import('../src/pinshapes.js');
 const renderMod = await import('../src/render.js');
+const strokeMod = await import('../src/stroke.js');
+const pathsMod = await import('../src/paths.js');
 const exportMod = await import('../src/export.js');
 
 // ---------------------------------------------------------------- projection
@@ -313,6 +315,18 @@ group('render pipeline (demo fixture)');
   check('export names its layers for Inkscape/LightBurn', exported.markup.includes('inkscape:label'));
   check('every path is closed off properly', (exported.markup.match(/<path/g) || []).length === (exported.markup.match(/\/>/g) || []).length);
 
+  // The whole point of outline geometry: nothing in the file relies on a
+  // stroke attribute, because xTool throws those away on import.
+  check('the export contains no stroked paths', !/stroke="(?!none)/.test(exported.markup));
+  check('the export contains no stroke widths', !exported.markup.includes('stroke-width'));
+  check('the export contains no unfilled paths', !exported.markup.includes('fill="none"'));
+  check('the frame survives as a filled band', /<g id="border"[^>]*><path d="[^"]+" fill="#/.test(exported.markup));
+
+  const centreLines = { ...state, style: { ...state.style, geometry: 'strokes' } };
+  const stroked = renderMod.renderSvg({ state: centreLines, layout, projection, prepared, labels, pin, mode: 'export' });
+  check('centre-line mode still offers stroke widths', stroked.markup.includes('stroke-width'));
+  check('outline mode costs more bytes than centre lines', exported.markup.length > stroked.markup.length);
+
   const perLayer = { ...state, style: { ...state.style, exportColors: 'layers' } };
   const coloured = renderMod.renderSvg({ state: perLayer, layout, projection, prepared, labels, pin, mode: 'export' });
   const colours = new Set(coloured.markup.match(/(?:stroke|fill)="#[0-9a-f]{6}"/g) || []);
@@ -474,6 +488,60 @@ group('caption size');
   const big = stateMod.createDefaultState();
   big.caption.scale = 1.8;
   check('a larger caption takes room from the map', layoutMod.computeLayout(big).mapBox.h < full.mapBox.h);
+}
+
+// -------------------------------------------------------- stroke expansion
+group('stroke expansion');
+{
+  // Arc commands carry five flags before their endpoint, so the numbers cannot
+  // simply be paired off; walk the commands instead.
+  const endpointsOf = (d) => {
+    const pts = [];
+    for (const m of d.matchAll(/([MLA])([^MLAZ]*)/g)) {
+      const nums = (m[2].match(/-?\d+(?:\.\d+)?/g) || []).map(Number);
+      if (m[1] === 'A') {
+        if (nums.length >= 7) pts.push([nums[5], nums[6]]);
+      } else {
+        for (let i = 0; i + 1 < nums.length; i += 2) pts.push([nums[i], nums[i + 1]]);
+      }
+    }
+    return pts;
+  };
+  const bboxOf = (d) => {
+    const pts = endpointsOf(d);
+    const xs = pts.map((p) => p[0]);
+    const ys = pts.map((p) => p[1]);
+    return { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) };
+  };
+
+  const straight = strokeMod.strokeOutline([[0, 0], [10, 0]], 2, { decimals: 3 });
+  check('a straight line becomes a closed shape', straight.startsWith('M') && straight.endsWith('Z'));
+  check('the shape is as wide as the stroke', near(bboxOf(straight).maxY - bboxOf(straight).minY, 2, 1e-6));
+  check('round caps do not shorten the line', bboxOf(straight).minX <= 0 + 1e-9);
+  const butt = strokeMod.strokeOutline([[0, 0], [10, 0]], 2, { cap: 'butt', decimals: 3 });
+  check('butt caps stop at the endpoints', near(bboxOf(butt).minX, 0, 1e-6) && near(bboxOf(butt).maxX, 10, 1e-6));
+  check('butt caps need no arcs', !butt.includes('A'));
+
+  const corner = strokeMod.strokeOutline([[0, 0], [10, 0], [10, 10]], 2, { decimals: 3 });
+  check('a corner still closes', corner.endsWith('Z'));
+  check('every arc turns the same way', (corner.match(/A[-\d.]+ [-\d.]+ 0 0 1 /g) || []).length === 0);
+  check('no NaN anywhere', !/NaN|Infinity/.test(corner));
+
+  check('a zero-length line becomes a dot', strokeMod.strokeOutline([[5, 5]], 2).includes('A'));
+  check('a butt-capped dot draws nothing', strokeMod.strokeOutline([[5, 5]], 2, { cap: 'butt' }) === '');
+  check('duplicate points are collapsed',
+    strokeMod.strokeOutline([[0, 0], [0, 0], [10, 0]], 2, { decimals: 3 }) === straight);
+  check('a whole layer expands in one go',
+    strokeMod.strokeOutlines([[[0, 0], [5, 0]], [[0, 5], [5, 5]]], 1).split('M').length === 3);
+
+  const band = pathsMod.roundedRectBandPath({ x: 10, y: 10, w: 80, h: 60 }, 4, 1, 3);
+  check('a frame band has an outer and an inner ring', band.split('M').length === 3);
+  check('the band inner ring runs the other way',
+    (band.match(/0 0 0 /g) || []).length === 4 && (band.match(/0 0 1 /g) || []).length === 4);
+  const thickBand = pathsMod.roundedRectBandPath({ x: 10, y: 10, w: 4, h: 4 }, 1, 20, 3);
+  check('an over-thick frame collapses to a solid shape', thickBand.split('M').length === 2);
+  check('a circular band has two rings', pathsMod.ellipseBandPath(50, 50, 20, 2, 3).split('M').length === 3);
+  check('an over-thick circular band is solid', pathsMod.ellipseBandPath(50, 50, 1, 20, 3).split('M').length === 2);
 }
 
 // ---------------------------------------------------------------- pin shapes
@@ -673,11 +741,10 @@ if (!process.argv.includes('--no-browser')) {
     await page.waitForTimeout(400);
 
     // The oval is the reference-photo shape: it should hug a longer word.
-    const ovalWidth = async () => {
-      const d = await page.locator('#pin path').first().getAttribute('d');
-      const xs = [...d.matchAll(/-?\d+(?:\.\d+)?/g)].map(Number).filter((_, i) => i % 2 === 0);
-      return Math.max(...xs) - Math.min(...xs);
-    };
+    // Measured with getBBox rather than by parsing path data, which now carries
+    // arc flags that cannot be paired off as coordinates.
+    const ovalWidth = () =>
+      page.evaluate(() => document.querySelector('#pin path').getBBox().width);
     const shortWord = await ovalWidth();
     await page.locator('input[placeholder="Home"]').fill('Grandma and Grandpa');
     await page.waitForTimeout(400);
@@ -709,11 +776,7 @@ if (!process.argv.includes('--no-browser')) {
 
     // --- the caption size slider is the quick way to reclaim map space
     const mapHeight = () =>
-      page.evaluate(() => {
-        const d = document.querySelector('#layer-residential path').getAttribute('d');
-        const ys = [...d.matchAll(/-?\d+(?:\.\d+)?/g)].map(Number).filter((_, i) => i % 2 === 1);
-        return Math.max(...ys) - Math.min(...ys);
-      });
+      page.evaluate(() => document.querySelector('#layer-residential path').getBBox().height);
     const captionText = () => page.locator('#caption-height-note').textContent();
     const beforeShrink = await mapHeight();
     const captionSlider = page.locator('#caption-scale input[type=range]');
@@ -778,15 +841,13 @@ if (!process.argv.includes('--no-browser')) {
     // --- border around the whole face, caption included
     await page.getByRole('button', { name: 'Map + caption', exact: true }).click();
     await page.waitForTimeout(350);
-    const wholeFaceBorder = await page.locator('#border path').getAttribute('d');
+    const borderHeight = () => page.evaluate(() => document.querySelector('#border path').getBBox().height);
+    const wholeFaceBorder = await borderHeight();
     await page.getByRole('button', { name: 'Map only', exact: true }).click();
     await page.waitForTimeout(350);
-    const mapOnlyBorder = await page.locator('#border path').getAttribute('d');
-    const height = (d) => {
-      const ys = [...d.matchAll(/-?\d+(?:\.\d+)?/g)].map(Number).filter((_, i) => i % 2 === 1);
-      return Math.max(...ys) - Math.min(...ys);
-    };
-    check('the border can enclose the caption too', height(wholeFaceBorder) > height(mapOnlyBorder) + 5);
+    const mapOnlyBorder = await borderHeight();
+    check('the border can enclose the caption too', wholeFaceBorder > mapOnlyBorder + 5,
+      `${wholeFaceBorder.toFixed(1)} vs ${mapOnlyBorder.toFixed(1)}`);
 
     // --- dragging the caption moves only the caption
     const captionBefore = await page.evaluate(() => document.querySelector('#caption path').getAttribute('d'));
@@ -892,6 +953,60 @@ if (!process.argv.includes('--no-browser')) {
     await page.waitForSelector('#preview svg', { timeout: 15000 });
     const restored = await page.locator('input[placeholder="Home"]').inputValue();
     check('a reload restores the design', restored === 'Family');
+
+    // Outlined geometry has to *look* like the strokes it replaces, or the
+    // offsetting maths is wrong in a way no attribute check would catch.
+    const bothModes = await page.evaluate(async () => {
+      const render = (geometry) => {
+        const key = 'city-map-coaster:design:v1';
+        const design = JSON.parse(localStorage.getItem(key));
+        design.style.geometry = geometry;
+        return design;
+      };
+      return [render('outlines'), render('strokes')];
+    });
+    const svgs = [];
+    for (const design of bothModes) {
+      await page.evaluate((d) => {
+        localStorage.setItem('city-map-coaster:design:v1', JSON.stringify(d));
+      }, design);
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForSelector('#preview svg');
+      await page.getByRole('button', { name: 'Use demo city' }).click();
+      await page.waitForFunction(() => /demo data/.test(document.querySelector('.stats')?.textContent || ''));
+      await page.waitForTimeout(600);
+      svgs.push(await page.evaluate(() => document.querySelector('#preview svg').outerHTML));
+    }
+    const mismatch = await page.evaluate(async ([a, b]) => {
+      const draw = (svg) =>
+        new Promise((resolve) => {
+          const img = new Image();
+          img.onload = () => {
+            const c = document.createElement('canvas');
+            c.width = 900;
+            c.height = 900;
+            const ctx = c.getContext('2d');
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(0, 0, 900, 900);
+            ctx.drawImage(img, 0, 0, 900, 900);
+            resolve(ctx.getImageData(0, 0, 900, 900).data);
+          };
+          img.onerror = () => resolve(null);
+          img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svg)));
+        });
+      const [pa, pb] = [await draw(a), await draw(b)];
+      if (!pa || !pb) return null;
+      let differing = 0;
+      let ink = 0;
+      for (let i = 0; i < pa.length; i += 4) {
+        if (pa[i] < 128) ink++;
+        if (Math.abs(pa[i] - pb[i]) > 60) differing++;
+      }
+      return { differing, ink };
+    }, svgs);
+    check('both geometry modes render the same picture',
+      mismatch && mismatch.ink > 1000 && mismatch.differing / mismatch.ink < 0.03,
+      mismatch ? `${((100 * mismatch.differing) / mismatch.ink).toFixed(2)}% of ink differs` : 'render failed');
 
     check('no unexpected console errors', problems.length === 0, problems.slice(0, 3).join(' | '));
     fs.rmSync(downloads, { recursive: true, force: true });

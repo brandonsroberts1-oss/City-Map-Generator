@@ -52,6 +52,9 @@ const presets = {
     s.view.spanMetres = 6000;
     s.labels.enabled = false;
   },
+  centrelines: (s) => {
+    s.style.geometry = 'strokes';
+  },
   noborder: (s) => {
     s.border.enabled = false;
     s.coaster.margin = 0;

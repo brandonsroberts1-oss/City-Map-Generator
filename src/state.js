@@ -124,6 +124,7 @@ export function createDefaultState() {
     },
     style: {
       previewTheme: 'slate',
+      geometry: 'outlines',
       exportColors: 'mono',
       exportInk: '#000000',
     },

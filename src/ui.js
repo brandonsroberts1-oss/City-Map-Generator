@@ -575,6 +575,16 @@ export function buildPanel({ store, actions }) {
     }), (s) => s.style.previewTheme),
     el('hr', { class: 'divider' }),
     bind(segmented({
+      label: 'Line geometry',
+      options: [
+        { value: 'outlines', label: 'Filled shapes', title: 'Every line becomes a closed shape of the right width' },
+        { value: 'strokes', label: 'Centre lines', title: 'Lines stay as strokes with a stroke-width' },
+      ],
+      value: st().style.geometry,
+      hint: 'xTool ignores stroke widths, so filled shapes are the safe choice — a 0.2 mm street stays 0.2 mm. Centre lines make a smaller file and suit LightBurn line mode.',
+      onChange: (v) => update((s) => { s.style.geometry = v; }),
+    }), (s) => s.style.geometry),
+    bind(segmented({
       label: 'SVG colours',
       options: [
         { value: 'mono', label: 'One colour', title: 'Everything in a single colour — one laser operation' },
