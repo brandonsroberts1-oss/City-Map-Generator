@@ -78,6 +78,26 @@ export function parseOverpass(json) {
     else if (el.type === 'relation') relations.push(el);
   }
 
+  /**
+   * Coordinates for a way or a relation member.
+   *
+   * `out geom` hands back the points inline, which is what the app asks for;
+   * the node-id form is still understood so saved data and the bundled demo
+   * city keep working.
+   */
+  const coordsOf = (el) => {
+    if (Array.isArray(el?.geometry)) {
+      const out = [];
+      for (const point of el.geometry) {
+        if (point && Number.isFinite(point.lon) && Number.isFinite(point.lat)) {
+          out.push([point.lon, point.lat]);
+        }
+      }
+      return out;
+    }
+    return (el?.nodes || []).map((id) => nodes.get(id)).filter(Boolean);
+  };
+
   const features = [];
   const consumedByRelation = new Set();
   const counts = {};
@@ -96,9 +116,9 @@ export function parseOverpass(json) {
     const innerFragments = [];
     for (const member of rel.members || []) {
       if (member.type !== 'way') continue;
-      const way = ways.get(member.ref);
-      if (!way || !way.nodes) continue;
-      const coords = way.nodes.map((id) => nodes.get(id)).filter(Boolean);
+      // Member geometry arrives with the relation under `out geom`, so the
+      // member way need not have been returned separately.
+      const coords = coordsOf(member.geometry ? member : ways.get(member.ref));
       if (coords.length < 2) continue;
       consumedByRelation.add(member.ref);
       if (member.role === 'inner') innerFragments.push(coords);
@@ -123,7 +143,7 @@ export function parseOverpass(json) {
     const tags = way.tags;
     if (!tags) continue;
     if (consumedByRelation.has(way.id) && !tags.building) continue;
-    const coords = (way.nodes || []).map((id) => nodes.get(id)).filter(Boolean);
+    const coords = coordsOf(way);
     if (coords.length < 2) continue;
 
     const closed = isClosedRing(coords);

@@ -10,13 +10,28 @@ import { buildKnockouts } from './knockouts.js';
 import { placeLabels } from './labels.js';
 import { renderSvg, computePin } from './render.js';
 import { parseOverpass } from './osm.js';
-import { fetchOverpass } from './overpass.js';
+import { fetchOverpass, BASE_FAMILIES } from './overpass.js';
+import { findCached, putCached, clearCache } from './cache.js';
 import { geocode } from './geocode.js';
 import { preloadFonts, preloadAll, fontFaceCss } from './typography.js';
 import { buildPanel } from './ui.js';
 import { downloadSvg, downloadDesign, readDesignFile, suggestedName } from './export.js';
 
 const DEMO_URL = 'assets/demo/sample-city.json';
+
+/**
+ * `?overpass=https://my-server/api/interpreter` sends every query to one
+ * instance instead of the public mirrors — useful if you run your own, and how
+ * the test suite drives the fetching path without touching the real servers.
+ */
+const ENDPOINT_OVERRIDE = (() => {
+  try {
+    const value = new URLSearchParams(location.search).get('overpass');
+    return value && /^https?:\/\//.test(value) ? [value] : null;
+  } catch {
+    return null;
+  }
+})();
 
 const dom = {
   panel: document.getElementById('panel'),
@@ -110,9 +125,31 @@ function setStatus(message, kind = 'info', sticky = false) {
     }, 4000);
   }
 }
+let busyTimer = null;
+let busyMessage = '';
+let busyStart = 0;
+
+/**
+ * Shows what the app is waiting for, with a running count once it has been a
+ * few seconds. A spinner that never changes is indistinguishable from a hang.
+ */
 function setBusy(busy, message) {
+  clearInterval(busyTimer);
+  busyTimer = null;
   dom.busy.classList.toggle('is-visible', Boolean(busy));
-  if (message) dom.busy.textContent = message;
+  if (!busy) {
+    busyStart = 0;
+    dom.busy.textContent = '';
+    return;
+  }
+  if (message !== undefined) busyMessage = message;
+  if (!busyStart) busyStart = Date.now();
+  const paint = () => {
+    const seconds = Math.round((Date.now() - busyStart) / 1000);
+    dom.busy.textContent = seconds >= 3 ? `${busyMessage} · ${seconds}s` : busyMessage;
+  };
+  paint();
+  busyTimer = setInterval(paint, 1000);
 }
 
 // ---------------------------------------------------------------- data needs
@@ -150,6 +187,49 @@ function scheduleFetch(delay = 450) {
   }, delay);
 }
 
+/**
+ * Ground area a building must cover to survive the size filter once projected.
+ * Past roughly a house's footprint there is no point downloading houses.
+ */
+function smallestVisibleBuildingM2(state) {
+  const layout = computeLayout(state);
+  const projection = createProjection({
+    lat: state.location.lat,
+    lon: state.location.lon,
+    spanMetres: state.view.spanMetres,
+    rect: layout.projectionRect,
+  });
+  const mmPerMetre = projection.mmPerMetre;
+  return mmPerMetre > 0 ? state.detail.minBuildingMm2 / (mmPerMetre * mmPerMetre) : Infinity;
+}
+
+const TYPICAL_HOUSE_M2 = 120;
+
+/** Loads one group of families, preferring the cache over the network. */
+async function loadGroup(families, { bounds, signal, label, skipSmallBuildings, hedgeDelayMs }) {
+  const cached = await findCached({ bounds, families });
+  if (cached) return { elements: cached.elements, fromCache: true };
+  if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+  setBusy(true, `Downloading ${label}…`);
+  const { json } = await fetchOverpass(bounds, families, {
+    signal,
+    hedgeDelayMs,
+    skipSmallBuildings,
+    endpoints: ENDPOINT_OVERRIDE || undefined,
+    onProgress: ({ kind, host }) => {
+      if (kind === 'hedge') setBusy(true, `Still waiting — also asking ${host} for ${label}…`);
+      else if (kind === 'failed') setBusy(true, `${host} did not answer — trying another server…`);
+    },
+  });
+  const elements = json.elements || [];
+  // Cache misses are not worth failing the load over.
+  putCached({ bounds, families, elements }).catch(() => {});
+  return { elements, fromCache: false };
+}
+
+let fetchGeneration = 0;
+
 async function fetchData() {
   const state = store.get();
   const families = requiredFamilies(state);
@@ -161,32 +241,82 @@ async function fetchData() {
 
   fetchController?.abort();
   fetchController = new AbortController();
-  // Fetch a margin around the visible window so small pans stay local.
-  const bounds = padBounds(neededBounds(state), 0.3);
-  setBusy(true, 'Downloading map data…');
+  const signal = fetchController.signal;
+  const generation = ++fetchGeneration;
 
-  try {
-    const { json } = await fetchOverpass(bounds, [...families], {
-      signal: fetchController.signal,
-      onProgress: (message) => setBusy(true, message),
-    });
-    const { features } = parseOverpass(json);
-    dataset = { features, bounds, families, source: 'overpass' };
-    setBusy(false);
-    if (!features.length) {
-      setStatus('No map data here — try a larger area or a different place.', 'warn');
-    } else {
-      setStatus(`Loaded ${features.length.toLocaleString()} map features.`, 'ok');
-    }
-    requestRender();
-  } catch (err) {
-    if (err.name === 'AbortError') return;
-    setBusy(false);
-    console.error(err);
+  // A modest margin around the visible window keeps small pans local without
+  // multiplying the download: padding every side by 30% fetches two and a half
+  // times the area, which is most of a slow request spent on nothing.
+  const bounds = padBounds(neededBounds(state), 0.12);
+  const skipSmallBuildings = smallestVisibleBuildingM2(state) > TYPICAL_HOUSE_M2;
+
+  const wanted = [...families];
+  const groups = [];
+  const base = wanted.filter((f) => BASE_FAMILIES.includes(f));
+  const rest = wanted.filter((f) => !BASE_FAMILIES.includes(f));
+  // Streets and water are quick and are most of the picture, so they are asked
+  // for separately and drawn the moment they land; buildings, which are the
+  // bulk of the bytes, catch up afterwards.
+  if (base.length) groups.push({ families: base, label: 'streets and water', hedgeDelayMs: 4000 });
+  if (rest.length) groups.push({ families: rest, label: 'buildings', hedgeDelayMs: 8000 });
+
+  busyStart = 0;
+  setBusy(true, `Downloading ${groups[0].label}…`);
+  dataset = { features: [], bounds, families: new Set(), source: 'overpass' };
+  requestRender();
+
+  let anyFromNetwork = false;
+  const results = await Promise.allSettled(
+    groups.map((group) =>
+      loadGroup(group.families, {
+        bounds,
+        signal,
+        label: group.label,
+        skipSmallBuildings,
+        hedgeDelayMs: group.hedgeDelayMs,
+      }).then((result) => {
+        if (generation !== fetchGeneration) return result;
+        const { features } = parseOverpass({ elements: result.elements });
+        dataset.features = dataset.features.concat(features);
+        for (const family of group.families) dataset.families.add(family);
+        if (!result.fromCache) anyFromNetwork = true;
+        requestRender();
+        return result;
+      })
+    )
+  );
+
+  if (generation !== fetchGeneration) return;
+  setBusy(false);
+
+  const failures = results.filter((r) => r.status === 'rejected').map((r) => r.reason);
+  if (failures.some((e) => e?.name === 'AbortError')) return;
+
+  if (failures.length === groups.length) {
+    console.error(failures[0]);
     setStatus(
-      `Could not download map data: ${err.message}. Check your connection, or press “Use demo city” to try the app offline.`,
+      `Could not reach OpenStreetMap: ${failures[0]?.message || 'no response'}. Try again, ` +
+        'zoom out a little, or press "Use demo city" to work offline.',
       'error',
       true
+    );
+    return;
+  }
+
+  if (failures.length) {
+    setStatus(
+      `Loaded the map, but ${groups.find((_, i) => results[i].status === 'rejected')?.label} did not arrive. Try again in a moment.`,
+      'warn'
+    );
+  } else if (!dataset.features.length) {
+    setStatus('No map data here — try a larger area or a different place.', 'warn');
+  } else {
+    const cached = !anyFromNetwork;
+    setStatus(
+      `Loaded ${dataset.features.length.toLocaleString()} map features${cached ? ' from cache' : ''}` +
+        (skipSmallBuildings && rest.length ? ' · houses omitted at this zoom (too small to engrave)' : '') +
+        '.',
+      'ok'
     );
   }
 }
@@ -527,6 +657,13 @@ const actions = {
     if (enabled && !store.get().pin.followCentre) {
       setStatus('Pin shown at the map centre. Drag it into place with “Click the preview to place”.', 'ok');
     }
+  },
+
+  async clearMapCache() {
+    await clearCache();
+    dataset = { features: [], bounds: null, families: new Set(), source: null };
+    setStatus('Cached map data cleared. The next view will be downloaded fresh.', 'ok');
+    scheduleFetch(0);
   },
 
   centrePin() {

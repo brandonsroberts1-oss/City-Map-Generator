@@ -608,7 +608,14 @@ export function buildPanel({ store, actions }) {
       button({ label: 'Download SVG', variant: 'primary', onClick: () => actions.exportSvg() }),
       button({ label: 'Save design', onClick: () => actions.saveDesign() }),
     ]),
-    row([button({ label: 'Open design', onClick: () => fileInput.click() })]),
+    row([
+      button({ label: 'Open design', onClick: () => fileInput.click() }),
+      button({
+        label: 'Clear map cache',
+        title: 'Forget the downloaded map data and fetch it fresh next time',
+        onClick: () => actions.clearMapCache(),
+      }),
+    ]),
     fileInput,
     statsNode
   );

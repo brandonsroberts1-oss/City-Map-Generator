@@ -28,7 +28,8 @@ kept in `localStorage` so it survives a reload.
 
 **Location.** Search any city, address or landmark, or paste `39.9943, -76.7298`
 straight into the box. Drag the preview to pan and scroll to zoom; map data is
-refetched only when you leave the area already downloaded.
+refetched only when you leave the area already downloaded, and anything
+downloaded before is reused from a local cache.
 
 **Layers.** Motorways, primary/secondary/minor roads, residential streets,
 service roads, footpaths, railways, rivers, streams and canals, lakes and bays,
@@ -141,6 +142,42 @@ to fall off the usable face.
 Streets thinner than about 0.15 mm tend to disappear on slate. If a design comes
 out too faint, raise **Overall line weight** rather than editing every layer.
 
+## When the download is slow
+
+OpenStreetMap's public Overpass servers are free, shared and frequently busy,
+and they are by far the slowest part of the app. Several things are done to keep
+that from being your problem:
+
+- **Streets first.** Streets and water are requested separately from buildings,
+  so the map draws as soon as the cheap half arrives rather than waiting for the
+  expensive half.
+- **A second server is started early.** If the first mirror has not answered
+  within a few seconds, the next one is asked in parallel and whichever replies
+  first wins. A mirror that returns "busy" is abandoned immediately.
+- **Every attempt has a deadline.** A server that accepts the connection and
+  then goes quiet used to leave the app waiting for ever; now it gives up and
+  says so.
+- **Only what is needed is asked for.** The query fetches coordinates inline
+  rather than making the server collect and return every node id separately
+  (about a third less to download and no second pass on the server), and the
+  margin fetched around the visible window is modest rather than generous —
+  together roughly half the bytes of a naive query.
+- **Houses are skipped when they cannot be engraved.** Above about 2.7 km
+  across, a typical house footprint is finer than the laser resolves and would
+  be filtered out after downloading it. Past that point houses, garages and
+  sheds are left out of the query — in a suburb that is most of the payload.
+  Larger buildings still come through, and the status line says when this
+  happens. Lowering **Smallest building kept** to zero turns it off.
+- **Nothing is downloaded twice.** Map data is cached in the browser, so
+  reopening a design, panning back, or toggling a layer off and on is instant.
+  **Clear map cache** in the export section forces a fresh download.
+
+If you run your own Overpass instance, `?overpass=https://your-server/api/interpreter`
+on the app's URL sends every query there instead of the public mirrors.
+
+Still slow? Reduce **Area covered**, or turn buildings off — they are the
+largest part of any request by a wide margin.
+
 ## Working offline
 
 **Use demo city** loads a synthetic town bundled with the app, so you can explore
@@ -162,7 +199,10 @@ it, that stroke expansion reproduces the widths it replaces, and — sweeping th
 demo city at five zoom levels — that clipping leaves behind neither hairline
 fills nor degenerate bridges. The export is checked to contain no stroke
 attributes whatsoever, and the two geometry modes are rendered in a real browser
-and compared pixel by pixel. The browser pass boots the app, cycles through all seven marker shapes,
+and compared pixel by pixel. The fetching tests run a mock Overpass server and
+check that a stalled mirror is overtaken, a busy one fails over at once, a total
+stall ends in an error rather than a hang, and a repeat view makes no request at
+all. The browser pass boots the app, cycles through all seven marker shapes,
 drags the caption, undoes and redoes, resets, shrinks the caption and checks the
 map grows, strands the pin in another city and checks switching it on brings it
 back, searches a stubbed place and checks the caption filled itself, then exports
@@ -170,6 +210,11 @@ an SVG and confirms it restores after a reload.
 
 `node tools/render-fixture.mjs out.svg --preset labels` renders the demo city
 headlessly, which is handy when changing the geometry pipeline.
+
+`node tools/mock-overpass.mjs 5300` stands in for the Overpass API, and can be
+told to stall, report itself busy or answer slowly. The fetching tests drive it
+to check the failover behaviour; you can also point the app at it with
+`?overpass=http://localhost:5300/api/interpreter`.
 
 ## How it fits together
 
@@ -179,7 +224,8 @@ headlessly, which is handy when changing the geometry pipeline.
 | `src/clip.js` | Convex clipping, artefact cleanup, and the subtraction that makes clear space |
 | `src/stroke.js` | Expands centre lines into closed filled outlines |
 | `src/simplify.js` | Douglas–Peucker thinning in millimetre space |
-| `src/overpass.js` | Query assembly and mirror fallback |
+| `src/overpass.js` | Query assembly, hedged mirror racing and per-attempt deadlines |
+| `src/cache.js` | IndexedDB cache of downloaded map data |
 | `src/geocode.js` | Nominatim with a Photon fallback |
 | `src/osm.js` | Overpass JSON → features, including multipolygon stitching |
 | `src/layers.js` | Tag → layer taxonomy, defaults, paint order |

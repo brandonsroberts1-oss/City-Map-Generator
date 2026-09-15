@@ -13,7 +13,12 @@ import path from 'path';
 
 const require = createRequire(import.meta.url);
 globalThis.opentype = require('opentype.js');
-globalThis.fetch = async (url) => {
+// The app fetches fonts and the demo fixture by relative path, which in node
+// means reading from disk. Anything with a scheme is a real request and must
+// reach the network stack — the fetching tests depend on it.
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url, init) => {
+  if (/^[a-z]+:\/\//i.test(String(url))) return realFetch(url, init);
   const file = String(url).replace(/^\//, '');
   if (!fs.existsSync(file)) return { ok: false, status: 404 };
   const b = fs.readFileSync(file);
@@ -170,15 +175,117 @@ group('OSM parsing');
 group('Overpass query building');
 {
   const q = overpass.buildQuery({ south: 1, west: 2, north: 3, east: 4 }, ['roads', 'buildings']);
-  check('query carries the bbox', q.includes('1.000000,2.000000,3.000000,4.000000'));
+  check('query carries the bbox', q.includes('1.00000,2.00000,3.00000,4.00000'));
   check('query asks for highways', q.includes('way["highway"]'));
   check('query asks for buildings', q.includes('way["building"]'));
   check('query skips families not requested', !q.includes('waterway'));
-  check('query recurses to nodes', q.includes('out body;') && q.includes('>;'));
+  // `out geom` returns coordinates inline. The older form made the server run a
+  // second pass over every referenced node and send them all back with their
+  // ids, which was both slower and about a third more to download.
+  check('query asks for inline geometry', q.trimEnd().endsWith('out geom;'));
+  check('query does not recurse to nodes', !q.includes('>;') && !q.includes('out skel'));
+  check('query timeout leaves room to fail over', /\[timeout:(\d+)\]/.exec(q)[1] <= 30);
   check('unknown families are ignored', !overpass.buildQuery({ south: 0, west: 0, north: 1, east: 1 }, ['nope']).includes('nope'));
+
+  const withHouses = overpass.buildQuery({ south: 0, west: 0, north: 1, east: 1 }, ['buildings']);
+  const withoutHouses = overpass.buildQuery({ south: 0, west: 0, north: 1, east: 1 }, ['buildings'], {
+    skipSmallBuildings: true,
+  });
+  check('houses are asked for by default', /way\["building"\]\(/.test(withHouses));
+  check('houses can be left out when they would be too small to engrave',
+    withoutHouses.includes('"building"!~') && withoutHouses.includes('garage'));
+  check('big buildings are still asked for either way', withoutHouses.includes('relation["building"]'));
+  check('streets and water are the first wave',
+    overpass.BASE_FAMILIES.includes('roads') && !overpass.BASE_FAMILIES.includes('buildings'));
   check('parseLatLon reads a pasted pair', geocode.parseLatLon('39.9943, -76.7298')?.lat === 39.9943);
   check('parseLatLon rejects out-of-range', geocode.parseLatLon('200, 400') === null);
   check('parseLatLon rejects prose', geocode.parseLatLon('York PA') === null);
+}
+
+// ------------------------------------------------------------ network behaviour
+group('fetching');
+{
+  const mock = spawn(process.execPath, ['tools/mock-overpass.mjs', '5301'], { stdio: 'ignore' });
+  await new Promise((r) => setTimeout(r, 600));
+  const endpoint = (query) => `http://localhost:5301/api/interpreter${query}`;
+  const bounds = { south: 39.07, west: -84.56, north: 39.14, east: -84.46 };
+  const timed = async (fn) => {
+    const started = Date.now();
+    try {
+      return { value: await fn(), ms: Date.now() - started };
+    } catch (error) {
+      return { error, ms: Date.now() - started };
+    }
+  };
+
+  try {
+    const healthy = await timed(() =>
+      overpass.fetchOverpass(bounds, ['roads'], { endpoints: [endpoint('')] })
+    );
+    check('a healthy server answers', healthy.value?.json.elements.length > 50);
+    check('inline geometry comes back', Boolean(healthy.value?.json.elements[0].geometry));
+
+    // The failure that used to leave the app spinning for ever: a server that
+    // accepts the connection and then says nothing.
+    const stalled = await timed(() =>
+      overpass.fetchOverpass(bounds, ['roads'], {
+        endpoints: [endpoint('?stall=1'), endpoint('')],
+        hedgeDelayMs: 500,
+      })
+    );
+    check('a stalled server is overtaken by the next mirror', Boolean(stalled.value));
+    check('the hedge starts without waiting for a failure', stalled.ms < 1500, `${stalled.ms}ms`);
+
+    const busy = await timed(() =>
+      overpass.fetchOverpass(bounds, ['roads'], {
+        endpoints: [endpoint('?busy=1'), endpoint('')],
+        hedgeDelayMs: 10000,
+      })
+    );
+    check('a busy server fails over at once', Boolean(busy.value) && busy.ms < 1000, `${busy.ms}ms`);
+
+    const slowButWorking = await timed(() =>
+      overpass.fetchOverpass(bounds, ['roads'], {
+        endpoints: [endpoint('?delay=500'), endpoint('?delay=8000')],
+        hedgeDelayMs: 200,
+      })
+    );
+    check('a slow first answer still wins if it arrives first',
+      slowButWorking.value && slowButWorking.ms < 2000, `${slowButWorking.ms}ms`);
+
+    const allStalled = await timed(() =>
+      overpass.fetchOverpass(bounds, ['roads'], {
+        endpoints: [endpoint('?stall=1'), endpoint('?stall=1')],
+        hedgeDelayMs: 200,
+        attemptTimeoutMs: 900,
+      })
+    );
+    check('a total stall ends in an error, not a hang', Boolean(allStalled.error), `${allStalled.ms}ms`);
+    check('and it ends promptly', allStalled.ms < 4000, `${allStalled.ms}ms`);
+    check('the error says what happened', /did not answer in time/.test(allStalled.error?.message || ''));
+
+    const aborted = await timed(async () => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 200);
+      return overpass.fetchOverpass(bounds, ['roads'], {
+        endpoints: [endpoint('?stall=1')],
+        signal: controller.signal,
+      });
+    });
+    check('the caller can cancel', aborted.error?.name === 'AbortError');
+
+    // A mistake in our own query must not burn through every mirror.
+    const badQuery = await timed(() =>
+      overpass.fetchOverpass(bounds, ['roads'], { endpoints: [endpoint('?busy=1'), endpoint('?busy=1')] })
+    );
+    check('exhausting the mirrors reports the last failure', /busy|HTTP 504/.test(badQuery.error?.message || ''));
+
+    const log = await (await fetch('http://localhost:5301/__log')).json();
+    check('the server was asked for inline geometry', log.log.every((e) => e.query.includes('out geom')));
+    check('no request recursed to nodes', log.log.every((e) => !e.query.includes('>;')));
+  } finally {
+    mock.kill();
+  }
 }
 
 // ---------------------------------------------------------------- typography
@@ -1007,6 +1114,55 @@ if (!process.argv.includes('--no-browser')) {
     check('both geometry modes render the same picture',
       mismatch && mismatch.ink > 1000 && mismatch.differing / mismatch.ink < 0.03,
       mismatch ? `${((100 * mismatch.differing) / mismatch.ink).toFixed(2)}% of ink differs` : 'render failed');
+
+    // --- the real fetching path, pointed at the mock server
+    const mockServer = spawn(process.execPath, ['tools/mock-overpass.mjs', '5302', '--delay', '150'], { stdio: 'ignore' });
+    await new Promise((r) => setTimeout(r, 600));
+    try {
+      const mockUrl = `http://localhost:${port}/?overpass=${encodeURIComponent('http://localhost:5302/api/interpreter')}`;
+      await page.goto(mockUrl, { waitUntil: 'domcontentloaded' });
+      await page.evaluate(() => localStorage.clear());
+      await page.evaluate(async () => {
+        await new Promise((resolve) => {
+          const request = indexedDB.deleteDatabase('city-map-coaster');
+          request.onsuccess = request.onerror = request.onblocked = resolve;
+        });
+      });
+      await page.goto(mockUrl, { waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(
+        () => /Loaded [\d,]+ map features/.test(document.querySelector('#status')?.textContent || ''),
+        null,
+        { timeout: 20000 }
+      );
+      check('the app loads real map data over the network', true);
+      check('streets came through', (await page.locator('#layer-residential path').count()) > 0);
+
+      const firstStatus = await page.locator('#status').textContent();
+      check('the first load is not served from cache', !/from cache/.test(firstStatus), firstStatus);
+
+      // Second visit to the same view must not touch the network at all.
+      const before = (await (await fetch('http://localhost:5302/__log')).json()).served;
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(
+        () => /Loaded [\d,]+ map features/.test(document.querySelector('#status')?.textContent || ''),
+        null,
+        { timeout: 20000 }
+      );
+      const after = (await (await fetch('http://localhost:5302/__log')).json()).served;
+      const cachedStatus = await page.locator('#status').textContent();
+      check('a repeat view is served from the cache', /from cache/.test(cachedStatus), cachedStatus);
+      check('and makes no further requests', after === before, `${after - before} extra requests`);
+
+      // Streets and buildings are asked for separately so the map can draw early.
+      const log = (await (await fetch('http://localhost:5302/__log')).json()).log;
+      const buildingQueries = log.filter((e) => /\["building"\]/.test(e.query));
+      const streetQueries = log.filter((e) => /\["highway"\]/.test(e.query));
+      check('streets and buildings are fetched separately',
+        streetQueries.length > 0 && buildingQueries.length > 0 &&
+          !streetQueries.some((e) => /\["building"\]/.test(e.query)));
+    } finally {
+      mockServer.kill();
+    }
 
     check('no unexpected console errors', problems.length === 0, problems.slice(0, 3).join(' | '));
     fs.rmSync(downloads, { recursive: true, force: true });
