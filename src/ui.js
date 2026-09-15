@@ -9,6 +9,7 @@ import { FONTS } from './typography.js';
 import { PREVIEW_THEMES } from './render.js';
 import { COASTER_PRESETS, captionLine } from './state.js';
 import { PIN_STYLES, TEXT_STYLES } from './pinshapes.js';
+import { TILE_SOURCES } from './tiles.js';
 
 const FONT_OPTIONS = FONTS.map((f) => ({ value: f.id, label: f.name, fontFamily: `'${f.name}', serif` }));
 const CASE_OPTIONS = [
@@ -81,6 +82,23 @@ export function buildPanel({ store, actions }) {
       format: (v) => formatSpan(10 ** v),
       onInput: (v) => update((s) => { s.view.spanMetres = Math.round(10 ** v); }, { refetch: true }),
     }), (s) => Math.log10(s.view.spanMetres)),
+    bind(select({
+      label: 'Map data source',
+      options: [
+        ...TILE_SOURCES.map((source) => ({ value: `tiles:${source.id}`, label: `${source.label} — fast` })),
+        { value: 'overpass', label: 'Overpass query — slow, raw OpenStreetMap' },
+      ],
+      value: st().data.source === 'tiles' ? `tiles:${st().data.tileSource}` : 'overpass',
+      hint: 'Vector tiles are prepared in advance and served from a CDN, so a city arrives in about a second. Overpass runs the query live against the whole planet and queues behind everyone else; it is the fallback if tiles fail.',
+      onChange: (value) => update((s) => {
+        if (value === 'overpass') {
+          s.data.source = 'overpass';
+        } else {
+          s.data.source = 'tiles';
+          s.data.tileSource = value.slice('tiles:'.length);
+        }
+      }, { refetch: true }),
+    }), (s) => (s.data.source === 'tiles' ? `tiles:${s.data.tileSource}` : 'overpass')),
     el('p', {
       class: 'field-hint',
       text: 'Drag the preview to pan, scroll to zoom. Map data © OpenStreetMap contributors.',

@@ -104,13 +104,39 @@ export function prepareFeatures(features, { projection, clip, state }) {
     const settings = state.layers[feature.layerId];
     if (!settings || !settings.enabled) continue;
 
+    // Vector tiles keep road and water names in their own layers, with their
+    // own copy of the geometry. Those features are labels, not ink.
+    if (feature.kind === 'point') {
+      if (!wantLabels || !feature.name) continue;
+      const category = labelCategory(feature.layerId);
+      if (!category) continue;
+      const anchor = projection.project(feature.point[0], feature.point[1]);
+      if (
+        anchor[0] < clipBounds.minX || anchor[0] > clipBounds.maxX ||
+        anchor[1] < clipBounds.minY || anchor[1] > clipBounds.maxY
+      ) {
+        continue;
+      }
+      labelCandidates.push({
+        name: feature.name,
+        category,
+        kind: 'area',
+        layerId: feature.layerId,
+        anchor,
+        length: null,
+      });
+      continue;
+    }
+
+    if (feature.labelOnly && !wantLabels) continue;
+
     if (feature.kind === 'line') {
       const projected = feature.line.map(project);
       if (boundsDisjoint(boundsOf(projected), clipBounds)) continue;
       const thinned = simplify(projected, tolerance);
       const pieces = clipPolyline(thinned, clip);
       if (!pieces.length) continue;
-      bucket(feature.layerId).lines.push(...pieces);
+      if (!feature.labelOnly) bucket(feature.layerId).lines.push(...pieces);
 
       if (wantLabels && feature.name) {
         const category = labelCategory(feature.layerId);
@@ -179,6 +205,26 @@ export function prepareFeatures(features, { projection, clip, state }) {
           if (!biggest || area > biggest.area) biggest = { area, ring: clipped };
         }
       }
+    }
+
+    if (!filled && feature.outlines?.length) {
+      const target = bucket(feature.layerId).outlines;
+      for (const path of feature.outlines) {
+        const projectedPath = path.map(project);
+        if (boundsDisjoint(boundsOf(projectedPath), clipBounds)) continue;
+        target.push(...clipPolyline(simplify(projectedPath, tolerance), clip));
+      }
+      if (wantLabels && feature.name && biggest) {
+        const category = labelCategory(feature.layerId);
+        if (category) {
+          labelCandidates.push({
+            name: feature.name, category, kind: 'area', layerId: feature.layerId,
+            anchor: centroidOfRing(biggest.ring), ring: biggest.ring,
+            area: totalArea, length: Math.sqrt(totalArea),
+          });
+        }
+      }
+      continue;
     }
 
     if (filled) {

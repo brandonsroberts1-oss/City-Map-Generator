@@ -202,6 +202,141 @@ group('Overpass query building');
   check('parseLatLon rejects prose', geocode.parseLatLon('York PA') === null);
 }
 
+// --------------------------------------------------------------- vector tiles
+group('vector tiles');
+{
+  const mvt = await import('../src/mvt.js');
+  const tiles = await import('../src/tiles.js');
+  const geojsonvt = (await import('geojson-vt')).default;
+  const vtpbf = (await import('vt-pbf')).default;
+
+  const TILE = { z: 14, x: 4345, y: 6255 };
+  const encode = (layers) => {
+    const out = {};
+    for (const [name, features] of Object.entries(layers)) {
+      const index = new geojsonvt({ type: 'FeatureCollection', features }, {
+        maxZoom: 14, indexMaxZoom: 14, buffer: 64,
+      });
+      const tile = index.getTile(TILE.z, TILE.x, TILE.y);
+      if (tile && tile.features.length) out[name] = tile;
+    }
+    return vtpbf.fromGeojsonVt(out, { version: 2 });
+  };
+  const feature = (geometry, properties) => ({ type: 'Feature', properties, geometry });
+
+  // --- decoding, checked against an independent encoder
+  const buffer = encode({
+    transportation: [feature({ type: 'LineString', coordinates: [[-84.52, 39.10], [-84.51, 39.11]] }, { class: 'primary' })],
+    water: [feature({ type: 'Polygon', coordinates: [
+      [[-84.518, 39.098], [-84.512, 39.098], [-84.512, 39.104], [-84.518, 39.104], [-84.518, 39.098]],
+      [[-84.517, 39.099], [-84.514, 39.099], [-84.514, 39.102], [-84.517, 39.102], [-84.517, 39.099]],
+    ] }, { class: 'lake', name: 'Test Lake', rank: 2, deep: true })],
+    water_name: [feature({ type: 'Point', coordinates: [-84.515, 39.101] }, { class: 'lake', name: 'Test Lake' })],
+  });
+  const decoded = mvt.decodeTile(buffer);
+  check('tile layers are found by name', Object.keys(decoded).sort().join(',') === 'transportation,water,water_name');
+  check('the tile extent is read', decoded.water.extent === 4096);
+  check('a line decodes to one path', decoded.transportation.features[0].geometry.length === 1);
+  check('a polygon with a hole decodes to two rings', decoded.water.features[0].geometry.length === 2);
+  check('string properties survive', decoded.water.features[0].properties.name === 'Test Lake');
+  check('numeric properties survive', decoded.water.features[0].properties.rank === 2);
+  check('boolean properties survive', decoded.water.features[0].properties.deep === true);
+  check('geometry types are reported', decoded.water_name.features[0].type === mvt.GEOMETRY_POINT);
+  check('an empty buffer decodes to nothing', Object.keys(mvt.decodeTile(new Uint8Array(0))).length === 0);
+
+  // --- tile arithmetic
+  const roundTripX = tiles.tileXToLon(tiles.lonToTileX(-84.512, 14), 14);
+  const roundTripY = tiles.tileYToLat(tiles.latToTileY(39.1031, 14), 14);
+  check('tile coordinates round-trip', near(roundTripX, -84.512, 1e-9) && near(roundTripY, 39.1031, 1e-9));
+  const box = { south: 39.07, west: -84.56, north: 39.14, east: -84.46 };
+  check('a view maps to a block of tiles', tiles.tilesForBounds(box, 14).length === 30);
+  check('zooming out uses fewer', tiles.tilesForBounds(box, 12).length < tiles.tilesForBounds(box, 14).length);
+  check('a wide view drops a zoom rather than asking for hundreds',
+    tiles.pickZoom({ south: 39, west: -85, north: 39.6, east: -84.3 }, 14) < 14);
+  check('a small view keeps full detail',
+    tiles.pickZoom({ south: 39.10, west: -84.52, north: 39.11, east: -84.51 }, 14) === 14);
+
+  // --- schema mapping
+  check('motorways map across', tiles.classify('transportation', { class: 'motorway' }) === 'motorway');
+  check('minor roads become residential', tiles.classify('transportation', { class: 'minor' }) === 'residential');
+  check('rivers and streams are told apart',
+    tiles.classify('waterway', { class: 'river' }) === 'riverLine' &&
+      tiles.classify('waterway', { class: 'stream' }) === 'streamLine');
+  check('buildings map across', tiles.classify('building', {}) === 'buildings');
+  check('woods count as green', tiles.classify('landcover', { class: 'wood' }) === 'landuseGreen');
+  check('unknown layers are ignored', tiles.classify('aeroway', { class: 'runway' }) === null);
+
+  // --- conversion
+  const converted = tiles.convertTile(TILE, decoded, {
+    wantedLayers: ['transportation', 'water', 'water_name'],
+    idPrefix: 't',
+  });
+  const lake = converted.find((f) => f.layerId === 'water' && f.kind === 'area');
+  const widthOf = (ring) => Math.max(...ring.map((p) => p[0])) - Math.min(...ring.map((p) => p[0]));
+  check('the outer ring is the outer one', lake && widthOf(lake.rings[0]) > widthOf(lake.holes[0]));
+  check('the hole is kept as a hole', lake?.holes.length === 1);
+  check('outline paths are produced for stroked drawing', lake?.outlines.length >= 1);
+  const point = converted.find((f) => f.kind === 'point');
+  check('a name point becomes a label anchor', point?.labelOnly === true && point.name === 'Test Lake');
+  check('road geometry is not label-only', converted.find((f) => f.layerId === 'primary')?.labelOnly === false);
+
+  // Features cut at a tile edge must not be outlined along that edge.
+  const spanning = tiles.convertTile(TILE, mvt.decodeTile(encode({
+    park: [feature({ type: 'Polygon', coordinates: [[
+      [-84.60, 39.05], [-84.40, 39.05], [-84.40, 39.15], [-84.60, 39.15], [-84.60, 39.05],
+    ]] }, { class: 'park', name: 'Big Park' })],
+  })), { wantedLayers: ['park'], idPrefix: 't' })[0];
+  check('a park larger than the tile still fills', spanning?.rings.length === 1);
+  check('but its outline is broken at the tile seam', spanning?.outlines.length < 1 + spanning.rings[0].length);
+
+  // --- fetching, against a tile server that behaves like a real one
+  const tileServer = spawn(process.execPath, ['tools/mock-tiles.mjs', '5402'], { stdio: 'ignore' });
+  await new Promise((r) => setTimeout(r, 1500));
+  try {
+    const source = 'http://localhost:5402/planet';
+    const resolved = await tiles.resolveTileSource(source);
+    check('TileJSON gives a tile template', resolved.template.includes('{z}'));
+    check('and a maximum zoom', resolved.maxzoom === 14);
+
+    const view = { south: 39.088, west: -84.53, north: 39.118, east: -84.494 };
+    const result = await tiles.fetchTiles(view, ['roads', 'water', 'buildings', 'waterways'], { sourceUrl: source });
+    check('tiles produce features', result.features.length > 500, `${result.features.length}`);
+    check('nothing failed', result.failures === 0);
+    check('the payload is small', result.bytes < 400 * 1024, `${(result.bytes / 1024).toFixed(0)} KB`);
+    check('street names come through', result.features.some((f) => f.labelOnly && f.name));
+    check('buildings come through', result.features.some((f) => f.layerId === 'buildings'));
+
+    const controller = new AbortController();
+    const cancelled = tiles.fetchTiles(view, ['roads'], { sourceUrl: source, signal: controller.signal });
+    controller.abort();
+    let cancelledProperly = false;
+    try {
+      await cancelled;
+    } catch (error) {
+      cancelledProperly = error.name === 'AbortError';
+    }
+    check('a tile fetch can be cancelled', cancelledProperly);
+
+    let missingHandled = true;
+    try {
+      await tiles.fetchTiles({ south: 60, west: -170, north: 60.01, east: -169.99 }, ['roads'], { sourceUrl: source });
+    } catch {
+      missingHandled = false;
+    }
+    check('empty tiles are an answer, not an error', missingHandled);
+
+    let badSource = false;
+    try {
+      await tiles.resolveTileSource('http://localhost:5402/not-tilejson');
+    } catch {
+      badSource = true;
+    }
+    check('a bad tile source reports itself', badSource);
+  } finally {
+    tileServer.kill();
+  }
+}
+
 // ------------------------------------------------------------ network behaviour
 group('fetching');
 {
@@ -1115,13 +1250,55 @@ if (!process.argv.includes('--no-browser')) {
       mismatch && mismatch.ink > 1000 && mismatch.differing / mismatch.ink < 0.03,
       mismatch ? `${((100 * mismatch.differing) / mismatch.ink).toFixed(2)}% of ink differs` : 'render failed');
 
+    // --- the vector tile path, end to end in a real browser
+    const tileServer2 = spawn(process.execPath, ['tools/mock-tiles.mjs', '5403'], { stdio: 'ignore' });
+    await new Promise((r) => setTimeout(r, 1500));
+    try {
+      const tileUrl = `http://localhost:${port}/?tiles=${encodeURIComponent('http://localhost:5403/planet')}`;
+      await page.goto(tileUrl, { waitUntil: 'domcontentloaded' });
+      await page.evaluate(async () => {
+        localStorage.setItem('city-map-coaster:design:v1', JSON.stringify({ view: { spanMetres: 2500 } }));
+        await new Promise((resolve) => {
+          const request = indexedDB.deleteDatabase('city-map-coaster');
+          request.onsuccess = request.onerror = request.onblocked = resolve;
+        });
+      });
+      const started = Date.now();
+      await page.goto(tileUrl, { waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(
+        () => /vector tiles/.test(document.querySelector('#status')?.textContent || ''),
+        null,
+        { timeout: 25000 }
+      );
+      const tileElapsed = Date.now() - started;
+      check('the map loads from vector tiles', true);
+      check('and does so quickly', tileElapsed < 8000, `${tileElapsed}ms`);
+      check('streets are drawn', (await page.locator('#layer-residential path').count()) > 0);
+      check('buildings are drawn', (await page.locator('#layer-buildings path').count()) > 0);
+
+      const requestsBefore = (await (await fetch('http://localhost:5403/__log')).json()).served;
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(
+        () => /from cache/.test(document.querySelector('#status')?.textContent || ''),
+        null,
+        { timeout: 25000 }
+      );
+      const requestsAfter = (await (await fetch('http://localhost:5403/__log')).json()).served;
+      check('a repeat view fetches no tiles', requestsAfter === requestsBefore);
+    } finally {
+      tileServer2.kill();
+    }
+
     // --- the real fetching path, pointed at the mock server
     const mockServer = spawn(process.execPath, ['tools/mock-overpass.mjs', '5302', '--delay', '150'], { stdio: 'ignore' });
     await new Promise((r) => setTimeout(r, 600));
     try {
       const mockUrl = `http://localhost:${port}/?overpass=${encodeURIComponent('http://localhost:5302/api/interpreter')}`;
       await page.goto(mockUrl, { waitUntil: 'domcontentloaded' });
-      await page.evaluate(() => localStorage.clear());
+      // Force the Overpass path, which is now only the fallback.
+      await page.evaluate(() => {
+        localStorage.setItem('city-map-coaster:design:v1', JSON.stringify({ data: { source: 'overpass' } }));
+      });
       await page.evaluate(async () => {
         await new Promise((resolve) => {
           const request = indexedDB.deleteDatabase('city-map-coaster');

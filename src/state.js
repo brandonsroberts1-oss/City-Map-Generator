@@ -46,6 +46,12 @@ export function createDefaultState() {
     view: {
       spanMetres: 6000,
     },
+    data: {
+      // Vector tiles are pre-built and served from a CDN; Overpass runs the
+      // query live against the planet and is minutes slower when it is busy.
+      source: 'tiles',
+      tileSource: 'openfreemap',
+    },
     coaster: {
       preset: 'slate-100',
       width: 100,

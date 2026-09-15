@@ -142,11 +142,37 @@ to fall off the usable face.
 Streets thinner than about 0.15 mm tend to disappear on slate. If a design comes
 out too faint, raise **Overall line weight** rather than editing every layer.
 
+## Where the map data comes from
+
+**Vector tiles (the default).** Pre-built squares of map data, served from a
+CDN. A city arrives in well under a second because nothing is computed when you
+ask for it — the work was done in advance and the answer is already sitting on
+a server near you. This is what every online map you have ever used does.
+[OpenFreeMap](https://openfreemap.org) and [VersaTiles](https://versatiles.org)
+both serve them free with no account, and the app decodes them itself.
+
+**Overpass (the fallback).** Runs your query live against the whole OpenStreetMap
+planet on a shared, free, frequently overloaded machine. It can answer questions
+tiles cannot, but for drawing a map it is the slow road: tens of seconds when
+the servers are busy, and timeouts when they are busier. The app falls back to
+it automatically if the tile server does not answer, and you can select it
+deliberately under **Map data source**.
+
+The practical difference on a typical view is about 56 KB and a fifth of a
+second against roughly a megabyte and however long the queue is.
+
+Tiles carry a fixed, generalised schema rather than raw OSM tags, so the layer
+set is slightly coarser — and above about 6 km across the app drops a zoom
+level, which is also where buildings stop being large enough to engrave. If you
+need something the tiles do not carry, switch to Overpass.
+
+`?tiles=https://your-server/planet` on the app's URL points it at a different
+tile source (a TileJSON endpoint, or a `{z}/{x}/{y}` template).
+
 ## When the download is slow
 
-OpenStreetMap's public Overpass servers are free, shared and frequently busy,
-and they are by far the slowest part of the app. Several things are done to keep
-that from being your problem:
+If you are on the Overpass fallback, its public servers are free, shared and
+frequently busy. Several things are done to keep that from being your problem:
 
 - **Streets first.** Streets and water are requested separately from buildings,
   so the map draws as soon as the cheap half arrives rather than waiting for the
@@ -168,15 +194,16 @@ that from being your problem:
   sheds are left out of the query — in a suburb that is most of the payload.
   Larger buildings still come through, and the status line says when this
   happens. Lowering **Smallest building kept** to zero turns it off.
-- **Nothing is downloaded twice.** Map data is cached in the browser, so
-  reopening a design, panning back, or toggling a layer off and on is instant.
-  **Clear map cache** in the export section forces a fresh download.
+- **Nothing is downloaded twice.** Map data is cached in the browser — for both
+  sources — so reopening a design, panning back, or toggling a layer off and on
+  is instant. **Clear map cache** in the export section forces a fresh download.
 
 If you run your own Overpass instance, `?overpass=https://your-server/api/interpreter`
 on the app's URL sends every query there instead of the public mirrors.
 
-Still slow? Reduce **Area covered**, or turn buildings off — they are the
-largest part of any request by a wide margin.
+Still slow? Make sure **Map data source** is set to a tile server rather than
+Overpass. Failing that, reduce **Area covered**, or turn buildings off — they
+are the largest part of any request by a wide margin.
 
 ## Working offline
 
@@ -202,7 +229,8 @@ attributes whatsoever, and the two geometry modes are rendered in a real browser
 and compared pixel by pixel. The fetching tests run a mock Overpass server and
 check that a stalled mirror is overtaken, a busy one fails over at once, a total
 stall ends in an error rather than a hang, and a repeat view makes no request at
-all. The browser pass boots the app, cycles through all seven marker shapes,
+all. The vector tile reader is checked against tiles produced by an independent
+encoder, and the tile path is driven end to end in a browser. The browser pass boots the app, cycles through all seven marker shapes,
 drags the caption, undoes and redoes, resets, shrinks the caption and checks the
 map grows, strands the pin in another city and checks switching it on brings it
 back, searches a stubbed place and checks the caption filled itself, then exports
@@ -216,6 +244,10 @@ told to stall, report itself busy or answer slowly. The fetching tests drive it
 to check the failover behaviour; you can also point the app at it with
 `?overpass=http://localhost:5300/api/interpreter`.
 
+`node tools/mock-tiles.mjs 5400` serves the demo city as real vector tiles, in
+the same schema a live server uses, for the tile tests and for
+`?tiles=http://localhost:5400/planet`.
+
 ## How it fits together
 
 | File | Job |
@@ -224,6 +256,8 @@ to check the failover behaviour; you can also point the app at it with
 | `src/clip.js` | Convex clipping, artefact cleanup, and the subtraction that makes clear space |
 | `src/stroke.js` | Expands centre lines into closed filled outlines |
 | `src/simplify.js` | Douglas–Peucker thinning in millimetre space |
+| `src/tiles.js` | Vector tiles: tile maths, fetching, and the OpenMapTiles schema |
+| `src/mvt.js` | A small Mapbox Vector Tile reader |
 | `src/overpass.js` | Query assembly, hedged mirror racing and per-attempt deadlines |
 | `src/cache.js` | IndexedDB cache of downloaded map data |
 | `src/geocode.js` | Nominatim with a Photon fallback |

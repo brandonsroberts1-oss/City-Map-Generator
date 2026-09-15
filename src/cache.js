@@ -78,7 +78,7 @@ function wastage(outer, inner) {
  * @returns {Promise<{elements: Array, bounds: object, families: string[]}|null>}
  *   the tightest cached entry that covers `bounds` and includes every family.
  */
-export async function findCached({ bounds, families }) {
+export async function findCached({ bounds, families, source }) {
   const db = await openDb();
   if (!db) return null;
   const wanted = [...families];
@@ -91,6 +91,7 @@ export async function findCached({ bounds, families }) {
   let best = null;
   for (const entry of entries) {
     if (!entry.bounds || !Array.isArray(entry.families)) continue;
+    if (source && entry.source !== source) continue;
     if (!wanted.every((family) => entry.families.includes(family))) continue;
     if (!covers(entry.bounds, bounds)) continue;
     const waste = wastage(entry.bounds, bounds);
@@ -105,12 +106,12 @@ export async function findCached({ bounds, families }) {
   return best.entry;
 }
 
-export async function putCached({ bounds, families, elements }) {
+export async function putCached({ bounds, families, source, features }) {
   const db = await openDb();
   if (!db) return false;
   const now = Date.now();
   const stored = await transact(db, 'readwrite', (store, done) => {
-    store.add({ bounds, families: [...families], elements, storedAt: now, usedAt: now });
+    store.add({ bounds, families: [...families], source, features, storedAt: now, usedAt: now });
     done(true);
   });
   if (stored) await evict(db);

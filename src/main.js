@@ -12,6 +12,7 @@ import { renderSvg, computePin } from './render.js';
 import { parseOverpass } from './osm.js';
 import { fetchOverpass, BASE_FAMILIES } from './overpass.js';
 import { findCached, putCached, clearCache } from './cache.js';
+import { fetchTiles, TILE_SOURCES } from './tiles.js';
 import { geocode } from './geocode.js';
 import { preloadFonts, preloadAll, fontFaceCss } from './typography.js';
 import { buildPanel } from './ui.js';
@@ -24,6 +25,15 @@ const DEMO_URL = 'assets/demo/sample-city.json';
  * instance instead of the public mirrors — useful if you run your own, and how
  * the test suite drives the fetching path without touching the real servers.
  */
+const TILE_OVERRIDE = (() => {
+  try {
+    const value = new URLSearchParams(location.search).get('tiles');
+    return value && /^https?:\/\//.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+})();
+
 const ENDPOINT_OVERRIDE = (() => {
   try {
     const value = new URLSearchParams(location.search).get('overpass');
@@ -207,8 +217,8 @@ const TYPICAL_HOUSE_M2 = 120;
 
 /** Loads one group of families, preferring the cache over the network. */
 async function loadGroup(families, { bounds, signal, label, skipSmallBuildings, hedgeDelayMs }) {
-  const cached = await findCached({ bounds, families });
-  if (cached) return { elements: cached.elements, fromCache: true };
+  const cached = await findCached({ bounds, families, source: 'overpass' });
+  if (cached) return { features: cached.features, fromCache: true };
   if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
   setBusy(true, `Downloading ${label}…`);
@@ -222,13 +232,90 @@ async function loadGroup(families, { bounds, signal, label, skipSmallBuildings, 
       else if (kind === 'failed') setBusy(true, `${host} did not answer — trying another server…`);
     },
   });
-  const elements = json.elements || [];
+  const { features } = parseOverpass(json);
   // Cache misses are not worth failing the load over.
-  putCached({ bounds, families, elements }).catch(() => {});
-  return { elements, fromCache: false };
+  putCached({ bounds, families, source: 'overpass', features }).catch(() => {});
+  return { features, fromCache: false };
+}
+
+/**
+ * Pulls the view from a vector tile server: a handful of small, pre-built,
+ * CDN-cached squares fetched in parallel, rather than one live query against
+ * the planet that has to queue behind everyone else's.
+ */
+async function loadFromTiles(families, { bounds, signal, sourceUrl }) {
+  const wanted = [...families];
+  const cached = await findCached({ bounds, families: wanted, source: 'tiles' });
+  if (cached) return { features: cached.features, fromCache: true };
+  if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+  setBusy(true, 'Downloading map tiles…');
+  const result = await fetchTiles(bounds, wanted, {
+    signal,
+    sourceUrl,
+    onProgress: ({ kind, done, total }) => {
+      if (kind === 'tile') setBusy(true, `Downloading map tiles — ${done} of ${total}…`);
+    },
+  });
+  putCached({ bounds, families: wanted, source: 'tiles', features: result.features }).catch(() => {});
+  return { features: result.features, fromCache: false, meta: result };
+}
+
+function tileSourceUrl(state) {
+  if (TILE_OVERRIDE) return TILE_OVERRIDE;
+  const chosen = TILE_SOURCES.find((s) => s.id === state.data.tileSource);
+  return (chosen || TILE_SOURCES[0]).url;
 }
 
 let fetchGeneration = 0;
+
+/** Draws whatever has arrived so far without disturbing a newer request. */
+function commitFeatures(generation, features, families) {
+  if (generation !== fetchGeneration) return;
+  dataset.features = dataset.features.concat(features);
+  for (const family of families) dataset.families.add(family);
+  requestRender();
+}
+
+async function fetchViaOverpass(generation, { state, families, bounds, signal }) {
+  const wanted = [...families];
+  const base = wanted.filter((f) => BASE_FAMILIES.includes(f));
+  const rest = wanted.filter((f) => !BASE_FAMILIES.includes(f));
+  const skipSmallBuildings = smallestVisibleBuildingM2(state) > TYPICAL_HOUSE_M2;
+
+  // Streets and water are quick and are most of the picture, so they are asked
+  // for separately and drawn the moment they land; buildings, which are the
+  // bulk of the bytes, catch up afterwards.
+  const groups = [];
+  if (base.length) groups.push({ families: base, label: 'streets and water', hedgeDelayMs: 4000 });
+  if (rest.length) groups.push({ families: rest, label: 'buildings', hedgeDelayMs: 8000 });
+
+  let anyFromNetwork = false;
+  const results = await Promise.allSettled(
+    groups.map((group) =>
+      loadGroup(group.families, {
+        bounds,
+        signal,
+        label: group.label,
+        skipSmallBuildings,
+        hedgeDelayMs: group.hedgeDelayMs,
+      }).then((result) => {
+        if (!result.fromCache) anyFromNetwork = true;
+        commitFeatures(generation, result.features, group.families);
+        return result;
+      })
+    )
+  );
+
+  const failures = results.filter((r) => r.status === 'rejected').map((r) => r.reason);
+  if (failures.some((e) => e?.name === 'AbortError')) throw failures.find((e) => e?.name === 'AbortError');
+  if (failures.length === groups.length) throw failures[0];
+  return {
+    fromCache: !anyFromNetwork,
+    partial: failures.length > 0,
+    note: skipSmallBuildings && rest.length ? 'houses omitted at this zoom (too small to engrave)' : '',
+  };
+}
 
 async function fetchData() {
   const state = store.get();
@@ -248,77 +335,66 @@ async function fetchData() {
   // multiplying the download: padding every side by 30% fetches two and a half
   // times the area, which is most of a slow request spent on nothing.
   const bounds = padBounds(neededBounds(state), 0.12);
-  const skipSmallBuildings = smallestVisibleBuildingM2(state) > TYPICAL_HOUSE_M2;
-
-  const wanted = [...families];
-  const groups = [];
-  const base = wanted.filter((f) => BASE_FAMILIES.includes(f));
-  const rest = wanted.filter((f) => !BASE_FAMILIES.includes(f));
-  // Streets and water are quick and are most of the picture, so they are asked
-  // for separately and drawn the moment they land; buildings, which are the
-  // bulk of the bytes, catch up afterwards.
-  if (base.length) groups.push({ families: base, label: 'streets and water', hedgeDelayMs: 4000 });
-  if (rest.length) groups.push({ families: rest, label: 'buildings', hedgeDelayMs: 8000 });
 
   busyStart = 0;
-  setBusy(true, `Downloading ${groups[0].label}…`);
   dataset = { features: [], bounds, families: new Set(), source: 'overpass' };
   requestRender();
 
-  let anyFromNetwork = false;
-  const results = await Promise.allSettled(
-    groups.map((group) =>
-      loadGroup(group.families, {
-        bounds,
-        signal,
-        label: group.label,
-        skipSmallBuildings,
-        hedgeDelayMs: group.hedgeDelayMs,
-      }).then((result) => {
-        if (generation !== fetchGeneration) return result;
-        const { features } = parseOverpass({ elements: result.elements });
-        dataset.features = dataset.features.concat(features);
-        for (const family of group.families) dataset.families.add(family);
-        if (!result.fromCache) anyFromNetwork = true;
-        requestRender();
-        return result;
-      })
-    )
-  );
+  const useTiles = state.data.source === 'tiles';
+  let outcome = null;
+  let tileError = null;
+
+  if (useTiles) {
+    try {
+      const result = await loadFromTiles(families, { bounds, signal, sourceUrl: tileSourceUrl(state) });
+      if (generation !== fetchGeneration) return;
+      dataset.source = 'tiles';
+      commitFeatures(generation, result.features, families);
+      outcome = {
+        fromCache: result.fromCache,
+        note: result.meta ? `${result.meta.tiles} tiles at zoom ${result.meta.zoom}` : '',
+      };
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+      tileError = error;
+    }
+  }
+
+  if (!outcome) {
+    if (tileError) {
+      console.warn('Tile source unavailable, falling back to Overpass', tileError);
+      setStatus('Tile server did not answer — falling back to the slower OpenStreetMap query…', 'warn');
+    }
+    try {
+      outcome = await fetchViaOverpass(generation, { state, families, bounds, signal });
+    } catch (error) {
+      if (generation !== fetchGeneration) return;
+      if (error?.name === 'AbortError') return;
+      setBusy(false);
+      console.error(error);
+      setStatus(
+        `Could not load map data: ${error?.message || 'no response'}. Try again, zoom out a little, ` +
+          'or press "Use demo city" to work offline.',
+        'error',
+        true
+      );
+      return;
+    }
+  }
 
   if (generation !== fetchGeneration) return;
   setBusy(false);
 
-  const failures = results.filter((r) => r.status === 'rejected').map((r) => r.reason);
-  if (failures.some((e) => e?.name === 'AbortError')) return;
-
-  if (failures.length === groups.length) {
-    console.error(failures[0]);
-    setStatus(
-      `Could not reach OpenStreetMap: ${failures[0]?.message || 'no response'}. Try again, ` +
-        'zoom out a little, or press "Use demo city" to work offline.',
-      'error',
-      true
-    );
+  if (!dataset.features.length) {
+    setStatus('No map data here — try a larger area or a different place.', 'warn');
     return;
   }
-
-  if (failures.length) {
-    setStatus(
-      `Loaded the map, but ${groups.find((_, i) => results[i].status === 'rejected')?.label} did not arrive. Try again in a moment.`,
-      'warn'
-    );
-  } else if (!dataset.features.length) {
-    setStatus('No map data here — try a larger area or a different place.', 'warn');
-  } else {
-    const cached = !anyFromNetwork;
-    setStatus(
-      `Loaded ${dataset.features.length.toLocaleString()} map features${cached ? ' from cache' : ''}` +
-        (skipSmallBuildings && rest.length ? ' · houses omitted at this zoom (too small to engrave)' : '') +
-        '.',
-      'ok'
-    );
-  }
+  const bits = [`Loaded ${dataset.features.length.toLocaleString()} map features`];
+  if (outcome.fromCache) bits.push('from cache');
+  else if (dataset.source === 'tiles') bits.push('from vector tiles');
+  if (outcome.note) bits.push(`· ${outcome.note}`);
+  if (outcome.partial) bits.push('· some layers did not arrive');
+  setStatus(bits.join(' ') + '.', outcome.partial ? 'warn' : 'ok');
 }
 
 async function loadDemo() {

@@ -84,9 +84,11 @@ export function placeLabels(candidates, { clip, settings, reserved = [] }) {
   const bestByName = new Map();
   for (const cand of candidates) {
     if (!wanted.has(cand.category)) continue;
-    if (cand.length < settings.minFeatureMm) continue;
+    // A point label (a lake name from a vector tile, say) has no length to
+    // measure, so the size filter does not apply to it.
+    if (cand.length != null && cand.length < settings.minFeatureMm) continue;
     const key = `${cand.category}:${cand.name.toLowerCase()}`;
-    const score = (PRIORITY[cand.layerId] || 10) * 1000 + cand.length;
+    const score = (PRIORITY[cand.layerId] || 10) * 1000 + (cand.length || 0);
     const existing = bestByName.get(key);
     if (!existing || score > existing.score) bestByName.set(key, { ...cand, score });
   }
@@ -107,6 +109,7 @@ export function placeLabels(candidates, { clip, settings, reserved = [] }) {
     let angle = 0;
 
     if (cand.kind === 'line') {
+      if (cand.length == null) continue;
       // A label needs a straight-ish run at least as long as the text.
       if (cand.length < metrics.width * 1.15) continue;
       const sample = sampleAlong(cand.points, cand.length / 2);
